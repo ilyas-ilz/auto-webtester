@@ -39,6 +39,9 @@ yarn-error.log*
 # windows crash dumps
 *.stackdump
 
+# runtime browser session/cookie state
+state.json
+
 # planning scratch docs (keep README/ARCHITECTURE/AGENTS/CLAUDE)
 Plan-*.md
 Plan.md
