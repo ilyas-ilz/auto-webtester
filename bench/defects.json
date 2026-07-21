@@ -1,0 +1,31 @@
+{
+  "comment": "Plan-v6 V9 seeded-defect manifest. A defect is DETECTED when a finding's pageUrl contains `path` (empty = any page), its agent belongs to `dimension`, and `keyword` (if set) appears in the finding's title+detail. Scoring: src/lib/runner/benchScore.ts.",
+  "defects": [
+    { "id": "s1", "app": "saas", "path": "", "dimension": "security", "keyword": "httponly", "severity": "high", "note": "session cookie set without HttpOnly" },
+    { "id": "s2", "app": "saas", "path": "", "dimension": "api", "keyword": "stats", "severity": "high", "note": "/api/stats always returns 500; dashboard shows Loading forever" },
+    { "id": "s3", "app": "saas", "path": "/dashboard", "dimension": "functional", "keyword": "typeerror", "severity": "medium", "note": "uncaught TypeError on dashboard load" },
+    { "id": "s4", "app": "saas", "path": "/reports", "dimension": "functional", "keyword": "404", "severity": "high", "note": "dashboard links /reports which 404s" },
+    { "id": "s5", "app": "saas", "path": "/admin", "dimension": "permissions", "keyword": "", "severity": "critical", "note": "no role check — user session can open the admin panel" },
+    { "id": "s6", "app": "saas", "path": "/items", "dimension": "a11y", "keyword": "alt", "severity": "medium", "note": "item thumbnails have no alt text" },
+    { "id": "s7", "app": "saas", "path": "/item/2", "dimension": "functional", "keyword": "empty", "severity": "medium", "note": "/item/2 renders an empty main" },
+    { "id": "s8", "app": "saas", "path": "/settings", "dimension": "a11y", "keyword": "label", "severity": "medium", "note": "settings inputs have no labels" },
+    { "id": "s9", "app": "saas", "path": "/settings", "dimension": "forms", "keyword": "", "severity": "high", "note": "settings form accepts submit with every required field empty" },
+    { "id": "s10", "app": "saas", "path": "/slow", "dimension": "perf", "keyword": "slow", "severity": "medium", "note": "~4.6s server delay on /slow" },
+    { "id": "s11", "app": "saas", "path": "", "dimension": "security", "keyword": "content-security-policy", "severity": "medium", "note": "no security headers sent at all" },
+    { "id": "c1", "app": "content", "path": "", "dimension": "seo", "keyword": "h1", "severity": "low", "note": "landing page has no h1" },
+    { "id": "c2", "app": "content", "path": "/articles", "dimension": "data-integrity", "keyword": "date", "severity": "low", "note": "mixed date formats on the article index" },
+    { "id": "c3", "app": "content", "path": "/articles", "dimension": "functional", "keyword": "typeerror", "severity": "medium", "note": "console TypeError on the article index" },
+    { "id": "c4", "app": "content", "path": "/article/9", "dimension": "functional", "keyword": "404", "severity": "high", "note": "index links /article/9 which 404s" },
+    { "id": "c5", "app": "content", "path": "/article", "dimension": "a11y", "keyword": "alt", "severity": "medium", "note": "article hero images have no alt text" },
+    { "id": "c6", "app": "content", "path": "/article/2", "dimension": "functional", "keyword": "empty", "severity": "medium", "note": "/article/2 is published but renders an empty main" },
+    { "id": "c7", "app": "content", "path": "/about", "dimension": "seo", "keyword": "title", "severity": "medium", "note": "/about has no <title>" },
+    { "id": "c8", "app": "content", "path": "", "dimension": "seo", "keyword": "description", "severity": "low", "note": "no page has a meta description" },
+    { "id": "p1", "app": "spa", "path": "", "dimension": "functional", "keyword": "load more", "severity": "high", "note": "Load more button throws on click, nothing happens" },
+    { "id": "p2", "app": "spa", "path": "/gallery", "dimension": "a11y", "keyword": "alt", "severity": "medium", "note": "gallery images have no alt text (route only reachable via button nav)" },
+    { "id": "p3", "app": "spa", "path": "/gallery", "dimension": "functional", "keyword": "typeerror", "severity": "medium", "note": "console TypeError when the gallery renders" },
+    { "id": "p4", "app": "spa", "path": "/contact", "dimension": "functional", "keyword": "empty", "severity": "high", "note": "contact route renders an empty main" },
+    { "id": "p5", "app": "spa", "path": "", "dimension": "a11y", "keyword": "name", "severity": "medium", "note": "icon-only theme button has no accessible name" },
+    { "id": "p6", "app": "spa", "path": "", "dimension": "a11y", "keyword": "label", "severity": "medium", "note": "quick-note form inputs have no labels" },
+    { "id": "p7", "app": "spa", "path": "", "dimension": "forms", "keyword": "", "severity": "medium", "note": "quick-note form accepts empty submit with no feedback" }
+  ]
+}

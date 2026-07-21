@@ -1,26 +1,63 @@
 @import "tailwindcss";
 
+/* Dark-only "mission control" theme. One palette, no dual light/dark upkeep. */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #0a0c10;
+  --foreground: #e4e7ee;
+  --panel: #11141b;
+  --panel-2: #161a23;
+  --line: #232936;
+  --muted: #8b93a7;
+  --accent: #6366f1;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-line: var(--line);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  color-scheme: dark;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  background-image: radial-gradient(circle at 1px 1px, rgb(255 255 255 / 0.04) 1px, transparent 0);
+  background-size: 28px 28px;
+}
+
+::selection {
+  background: rgb(99 102 241 / 0.35);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 8px;
+  border: 2px solid var(--background);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Section label used across pages: small mono uppercase */
+.section-label {
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
 }

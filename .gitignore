@@ -36,6 +36,12 @@ yarn-error.log*
 # vercel
 .vercel
 
+# runtime data — sqlite db, encryption key, run screenshots, visual baselines
+/data
+/public/shots
+/public/traces
+/public/baselines
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

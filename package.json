@@ -6,21 +6,35 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "agents": "tsx src/lib/runner/cli.ts",
+    "agents:test": "tsx src/lib/runner/selftest.ts",
+    "bench": "tsx bench/run.ts",
+    "ui:e2e": "tsx e2e/dashboard.e2e.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.104.1",
+    "axe-core": "^4.12.1",
+    "better-sqlite3": "^12.10.0",
+    "chrome-launcher": "^1.2.1",
+    "lighthouse": "^13.4.1",
+    "nanoid": "^5.1.11",
     "next": "16.2.9",
+    "playwright": "^1.60.0",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.2.9",
     "tailwindcss": "^4",
+    "tsx": "^4.20.3",
     "typescript": "^5"
   }
 }
