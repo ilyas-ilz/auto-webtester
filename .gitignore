@@ -33,6 +33,13 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# playwright mcp / scratch
+.playwright-mcp/
+
+# planning scratch docs (keep README/ARCHITECTURE/AGENTS/CLAUDE)
+Plan-*.md
+Plan.md
+
 # vercel
 .vercel
 
