@@ -36,6 +36,9 @@ yarn-error.log*
 # playwright mcp / scratch
 .playwright-mcp/
 
+# windows crash dumps
+*.stackdump
+
 # planning scratch docs (keep README/ARCHITECTURE/AGENTS/CLAUDE)
 Plan-*.md
 Plan.md
