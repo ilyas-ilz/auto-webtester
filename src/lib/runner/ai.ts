@@ -5,7 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 // Keys live in .env.local — Next.js loads it into the server process that
 // executes runs; nothing is sent anywhere except the chosen provider.
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "google/gemini-2.0-flash-001";
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "google/gemini-2.5-flash";
 
 export function aiAvailable(): boolean {
   return !!(process.env.ANTHROPIC_API_KEY || process.env.OPENROUTER_API_KEY);

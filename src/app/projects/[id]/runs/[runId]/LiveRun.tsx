@@ -91,6 +91,24 @@ export function LiveRun({ projectId, projectName, initialRun, initialEvents, ini
     return pool.length ? pool[pool.length - 1] : null;
   }, [shots, pinnedRole]);
 
+  // Live view (V8): poll the runner's CDP screencast frame (~4fps). Each frame is
+  // preloaded off-DOM and only swapped in once decoded, so the <img> never blanks
+  // between frames — this is what makes it read as video instead of a slideshow.
+  const [liveFrame, setLiveFrame] = useState<string | null>(null);
+  useEffect(() => {
+    if (run.status !== "running" || pinnedRole) { setLiveFrame(null); return; }
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      const img = new Image();
+      img.onload = () => { if (!alive) return; setLiveFrame(img.src); timer = setTimeout(tick, 250); };
+      img.onerror = () => { if (alive) timer = setTimeout(tick, 2000); }; // no frame yet (run warming up / non-chromium)
+      img.src = `/shots/${run.id}/live.jpg?t=${Date.now()}`;
+    };
+    tick();
+    return () => { alive = false; clearTimeout(timer); };
+  }, [run.status, run.id, pinnedRole]);
+
   // Narration + agent timeline (V3): "status" events answer what an agent is doing
   // right now; agent-start/agent-done (emitted once, in withRecovery) drive the
   // queued/running/done state of every agent the Mission Planner scheduled.
@@ -185,7 +203,7 @@ export function LiveRun({ projectId, projectName, initialRun, initialEvents, ini
 
       {run.summary && <Card className="whitespace-pre-line border-l-2 border-l-indigo-500 p-4 text-sm">{run.summary}</Card>}
 
-      {shots.length > 0 && (
+      {(shots.length > 0 || liveFrame) && (
         <Card className="p-4">
           <div className="flex items-center justify-between">
             <div className="section-label">Live view</div>
@@ -209,13 +227,14 @@ export function LiveRun({ projectId, projectName, initialRun, initialEvents, ini
               </div>
             )}
           </div>
-          {latestShot ? (
+          {liveFrame || latestShot ? (
             <>
               {/* eslint-disable-next-line @next/next/no-img-element -- runtime screenshot with unknown dimensions, not a static asset */}
-              <img src={latestShot.src} alt="" className="mt-2 max-h-[28rem] w-full rounded-lg border border-line bg-panel-2 object-contain object-top" />
+              <img src={liveFrame ?? latestShot!.src} alt="" className="mt-2 max-h-[28rem] w-full rounded-lg border border-line bg-panel-2 object-contain object-top" />
               <div className="mt-1.5 font-mono text-[11px] text-muted">
-                {latestShot.role ? `${latestShot.role} · ` : ""}
-                {new Date(latestShot.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                {liveFrame
+                  ? "● live"
+                  : <>{latestShot!.role ? `${latestShot!.role} · ` : ""}{new Date(latestShot!.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</>}
               </div>
             </>
           ) : (

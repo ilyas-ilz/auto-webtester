@@ -133,6 +133,35 @@ export class RunContext {
     // every page fixes all agents at once; harmless under the Next.js bundler.
     await browserCtx.addInitScript("self.__name = self.__name || ((fn) => fn);").catch(() => {});
     await browserCtx.tracing.start({ screenshots: true, snapshots: true }).catch(() => {});
+    this.attachLiveView(browserCtx);
+  }
+
+  /**
+   * Live view (V8): CDP screencast on every page of the context, each frame
+   * overwriting one well-known file the UI polls at ~4fps — real video-ish
+   * live view instead of the sparse screenshot-event slideshow. Chromium only;
+   * silently a no-op elsewhere. Last page to render wins the frame file, which
+   * is exactly the "follow whatever the run is doing now" behavior we want.
+   */
+  private attachLiveView(browserCtx: BrowserContext): void {
+    const file = path.join(this.shotDir, "live.jpg");
+    const tmp = path.join(this.shotDir, "live.jpg.tmp");
+    const hook = async (page: Page) => {
+      try {
+        const cdp = await browserCtx.newCDPSession(page);
+        await cdp.send("Page.startScreencast", { format: "jpeg", quality: 55, maxWidth: 1280, maxHeight: 900, everyNthFrame: 2 });
+        cdp.on("Page.screencastFrame", (f: { data: string; sessionId: number }) => {
+          cdp.send("Page.screencastFrameAck", { sessionId: f.sessionId }).catch(() => {});
+          try {
+            // tmp+rename so the UI never reads a half-written jpeg
+            fs.writeFileSync(tmp, Buffer.from(f.data, "base64"));
+            fs.renameSync(tmp, file);
+          } catch { /* frame dropped — next one lands in ~100ms */ }
+        });
+      } catch { /* non-chromium browser or page closed mid-attach */ }
+    };
+    browserCtx.on("page", (p) => void hook(p));
+    for (const p of browserCtx.pages()) void hook(p);
   }
 
   /** Stops the trace started for this context and records it for the run report. Call before `browserCtx.close()`. */
