@@ -109,8 +109,12 @@ export async function loginAgent(
     const passField = page.locator('input[type="password"]').first();
 
     try {
-      await userField.waitFor({ state: "visible", timeout: 10000 });
-      await passField.waitFor({ state: "visible", timeout: 10000 });
+      // 20s, not 10s: cold-start / CPU-throttled hosting (a DigitalOcean app instance
+      // in our own run took >10s to paint the form) made this abort before the login
+      // page had rendered, and the run reported "could not locate login form fields"
+      // on an app whose credentials were perfectly fine.
+      await userField.waitFor({ state: "visible", timeout: 20000 });
+      await passField.waitFor({ state: "visible", timeout: 20000 });
     } catch {
       return { ok: false, formFound: false, siteError: null };
     }
@@ -153,9 +157,9 @@ export async function loginAgent(
     // hydration, so a first click can land before signIn() exists and silently
     // no-op (seen under rapid multi-role logins with several contexts open).
     let ok = false;
-    for (let i = 0; i < 32; i++) { // up to ~16s
+    for (let i = 0; i < 60; i++) { // up to ~30s — a manual sign-in on a throttled host took ~8s to redirect; 16s left no margin once the app was under crawl load
       if (await succeeded()) { ok = true; break; }
-      if ((i === 8 || i === 18) && !(await extractLoginError(page))) await clickSubmit();
+      if ((i === 8 || i === 18 || i === 36) && !(await extractLoginError(page))) await clickSubmit();
       await page.waitForTimeout(500);
     }
     if (ok) return { ok: true, formFound: true, siteError: null };

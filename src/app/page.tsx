@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { listProjectsSafe, listRuns } from "@/lib/db";
+import { listProjectsSafe, listRuns, listFindings } from "@/lib/db";
 import { Card } from "@/components/Card";
 import { StatusBadge } from "@/components/StatusBadge";
 import { timeAgo } from "@/lib/format";
@@ -8,6 +8,14 @@ const ENV_STYLES: Record<string, string> = {
   localhost: "border-zinc-600/40 bg-zinc-500/10 text-zinc-300",
   staging: "border-amber-500/40 bg-amber-500/10 text-amber-300",
   production: "border-violet-500/40 bg-violet-500/10 text-violet-300",
+};
+
+const SEV_ORDER = ["critical", "high", "medium", "low"] as const;
+const SEV_STYLES: Record<string, string> = {
+  critical: "border-red-500/40 bg-red-500/10 text-red-300",
+  high: "border-orange-500/40 bg-orange-500/10 text-orange-300",
+  medium: "border-amber-500/40 bg-amber-500/10 text-amber-300",
+  low: "border-sky-500/40 bg-sky-500/10 text-sky-300",
 };
 
 export default function Home() {
@@ -36,6 +44,8 @@ export default function Home() {
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((p) => {
             const lastRun = listRuns(p.id)[0];
+            // ponytail: counted in the page, not cached — a handful of projects, one SQLite read each.
+            const sev = lastRun ? listFindings(lastRun.id).reduce((a, f) => ({ ...a, [f.severity]: (a[f.severity] ?? 0) + 1 }), {} as Record<string, number>) : {};
             return (
               <Link key={p.id} href={`/projects/${p.id}`}>
                 <Card className="flex h-full flex-col gap-3 p-5 transition-colors hover:border-indigo-500/40 hover:bg-panel-2">
@@ -44,6 +54,12 @@ export default function Home() {
                     <span className={`shrink-0 rounded-md border px-2 py-0.5 font-mono text-[11px] uppercase tracking-wider ${ENV_STYLES[p.envTag]}`}>{p.envTag}</span>
                   </div>
                   <p className="truncate font-mono text-xs text-muted">{p.baseUrl}</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {SEV_ORDER.map((s) => sev[s] ? (
+                      <span key={s} className={`rounded-md border px-1.5 py-0.5 font-mono text-[11px] ${SEV_STYLES[s]}`}>{sev[s]} {s}</span>
+                    ) : null)}
+                    {lastRun && !SEV_ORDER.some((s) => sev[s]) ? <span className="font-mono text-[11px] text-muted">no findings</span> : null}
+                  </div>
                   <div className="mt-auto flex items-center justify-between border-t border-line pt-3 text-xs text-muted">
                     <span>{p.roles.length} role{p.roles.length === 1 ? "" : "s"}</span>
                     {lastRun ? (

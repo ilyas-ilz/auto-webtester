@@ -15,6 +15,18 @@ const MAX_ADOPTED = 8; // ponytail: cap on click-discovered routes per role — 
  * template (mirrors the crawler's sampling so 114 surahs ≠ 114 adoptions).
  * Mutates perTemplate on accept.
  */
+/**
+ * True when a console line is a real JavaScript error (thrown exception), false when
+ * it's the browser reporting a failed network request. Only the former justifies
+ * "clicking this control is broken" — the latter is reported by route-health per page.
+ */
+export function isJsError(line: string): boolean {
+  if (/^failed to load resource\b/i.test(line.trim())) return false;
+  if (/^(net::|access to (fetch|xmlhttprequest))/i.test(line.trim())) return false;
+  if (/\b(refused to (connect|load|execute)|blocked by cors|content security policy)\b/i.test(line)) return false;
+  return true;
+}
+
 export function shouldAdoptRoute(url: string, origin: string, known: Set<string>, perTemplate: Map<string, number>): boolean {
   let u: URL;
   try { u = new URL(url); } catch { return false; }
@@ -150,6 +162,10 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
     const crawled = queue.shift()!;
     explored++;
     const page = await browserCtx.newPage();
+    // "Failed to load resource: … 401" is a *network* failure the browser logs to the
+    // console — attributing it to the click that happened to be in flight produced
+    // findings like `Clicking "ഹോം" throws a JS error → 401 analytics beacon`, which is
+    // wrong twice: it isn't a JS error, and the click didn't cause it.
     const consoleErrors: string[] = [];
     page.on("pageerror", (e) => consoleErrors.push(String(e).slice(0, 200)));
     page.on("console", (m) => { if (m.type() === "error") consoleErrors.push(m.text().slice(0, 200)); });
@@ -238,13 +254,19 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
         }
 
         const nodesAfter = await page.evaluate(() => document.querySelectorAll("*").length).catch(() => nodesBefore);
-        if (consoleErrors.length > errBefore) {
+        const newErrors = consoleErrors.slice(errBefore);
+        const jsErrors = newErrors.filter(isJsError); // background 401/CORS beacons are route-health's job, not "this click is broken"
+        if (jsErrors.length) {
           ctx.finding({
             agent: AGENT, severity: "medium", role: role.name, pageUrl: crawled.url,
             title: `Clicking "${label || "(unlabeled control)"}" throws a JS error`,
-            detail: consoleErrors.slice(errBefore).join("\n"),
+            detail: jsErrors.join("\n"),
             evidence: await ctx.screenshot(page, `click-error-${label || "control"}`),
           });
+        } else if (newErrors.length && Math.abs(nodesAfter - nodesBefore) >= 2) {
+          // Something happened AND a request failed — worth saying, but as a failed
+          // request, not as a JS exception the click threw.
+          ctx.log(AGENT, "step", `Click "${label || "(unlabeled)"}" produced a failed request: ${newErrors[0]}`);
         } else if (Math.abs(nodesAfter - nodesBefore) < 2) {
           // ponytail: DOM-node-count delta as the "did anything happen" proxy;
           // misses pure style/canvas changes — upgrade to MutationObserver if noisy.

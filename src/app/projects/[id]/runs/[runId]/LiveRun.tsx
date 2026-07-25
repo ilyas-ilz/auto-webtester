@@ -36,24 +36,33 @@ export function LiveRun({ projectId, projectName, initialRun, initialEvents, ini
   useEffect(() => {
     if (run.status !== "running") return;
     let lastEventId = events.length ? events[events.length - 1].id : 0;
-    const interval = setInterval(async () => {
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout>;
+    // Self-scheduling poll, not setInterval: a slow tick used to overlap the next one,
+    // both asked for ?after=<same id>, and the same events got appended twice —
+    // React then saw duplicate keys. One request in flight at a time fixes it at the root.
+    const tick = async () => {
       try {
         const [runRes, eventsRes, findingsRes] = await Promise.all([
           fetch(`/api/runs/${run.id}`).then((r) => r.json()),
           fetch(`/api/runs/${run.id}/events?after=${lastEventId}`).then((r) => r.json()),
           fetch(`/api/runs/${run.id}/findings`).then((r) => r.json()),
         ]);
+        if (!alive) return;
         setRun(runRes);
-        if (eventsRes.length) {
-          lastEventId = eventsRes[eventsRes.length - 1].id;
-          setEvents((prev) => [...prev, ...eventsRes]);
+        const fresh = (eventsRes as RunEvent[]).filter((e) => e.id > lastEventId); // belt-and-braces vs a stale response
+        if (fresh.length) {
+          lastEventId = fresh[fresh.length - 1].id;
+          setEvents((prev) => [...prev, ...fresh]);
         }
         setFindings(findingsRes);
       } catch {
         // transient network hiccup — next tick retries
       }
-    }, 1500);
-    return () => clearInterval(interval);
+      if (alive) timer = setTimeout(tick, 1500);
+    };
+    timer = setTimeout(tick, 1500);
+    return () => { alive = false; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- lastEventId is a closure var, not state; re-running on run.status change is intentional
   }, [run.status, run.id]);
 
@@ -196,8 +205,23 @@ export function LiveRun({ projectId, projectName, initialRun, initialEvents, ini
             <StatusBadge status={run.status} />
           </div>
         </div>
-        <div className="font-mono text-xs text-muted">
-          Started {timeAgo(run.startedAt)} · {duration(run.startedAt, run.finishedAt)}{run.aiTokens > 0 ? ` · ${run.aiTokens} AI tokens` : ""}
+        <div className="flex flex-col items-end gap-2">
+          <div className="font-mono text-xs text-muted">
+            Started {timeAgo(run.startedAt)} · {duration(run.startedAt, run.finishedAt)}{run.aiTokens > 0 ? ` · ${run.aiTokens} AI tokens` : ""}
+          </div>
+          {run.status !== "running" && (
+            <div className="flex gap-2">
+              {(["md", "pdf"] as const).map((f) => (
+                <a
+                  key={f}
+                  href={`/api/runs/${run.id}/report?format=${f}`}
+                  className="rounded-md border border-line px-2.5 py-1 font-mono text-[11px] uppercase tracking-wider text-muted transition-colors hover:border-indigo-500/40 hover:text-foreground"
+                >
+                  ↓ {f}
+                </a>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
@@ -234,7 +258,8 @@ export function LiveRun({ projectId, projectName, initialRun, initialEvents, ini
               <div className="mt-1.5 font-mono text-[11px] text-muted">
                 {liveFrame
                   ? "● live"
-                  : <>{latestShot!.role ? `${latestShot!.role} · ` : ""}{new Date(latestShot!.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</>}
+                  : <>{latestShot!.role ? `${latestShot!.role} · ` : ""}{/* fixed locale, not [] — the server's default locale rendered "05:50:32 pm" while the browser rendered "17:50:32", which is a hydration mismatch */}
+                    {new Date(latestShot!.ts).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</>}
               </div>
             </>
           ) : (

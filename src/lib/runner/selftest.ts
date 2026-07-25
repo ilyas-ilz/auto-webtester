@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { UNSAFE, urlTemplate } from "./agents/crawler";
-import { shouldAdoptRoute } from "./agents/interaction";
+import { shouldAdoptRoute, isJsError } from "./agents/interaction";
+import { tidyWhy } from "./agents/a11y";
 import { inferPageType } from "./agents/expectations";
 import { encrypt, decrypt, fingerprint } from "../crypto";
 import { riskScore } from "./graph";
@@ -90,6 +91,28 @@ console.log("selftest OK: crawler URL templates collapse sibling pages");
   assert.ok(!shouldAdoptRoute("https://evil.com/surah/2", "https://x.com", known, perTpl), "cross-origin must be rejected");
   assert.ok(!shouldAdoptRoute("https://x.com/logout", "https://x.com", known, perTpl), "session-ending route must be rejected");
   console.log("selftest OK: interaction adopts click-discovered routes with template sampling");
+}
+
+// A click is only "broken" when it threw JS. Browser-logged network failures (the 401
+// analytics beacon that made us file `Clicking "ഹോം" throws a JS error`) are not that.
+{
+  assert.ok(isJsError("TypeError: Cannot read properties of undefined (reading 'id')"), "a thrown exception is a JS error");
+  assert.ok(isJsError("Uncaught (in promise) Error: boom"), "an unhandled rejection is a JS error");
+  assert.ok(!isJsError("Failed to load resource: the server responded with a status of 401 ()"), "a failed request is not a JS error");
+  assert.ok(!isJsError("net::ERR_CONNECTION_REFUSED"), "a network stack error is not a JS error");
+  assert.ok(!isJsError("Access to fetch at 'https://a.b' from origin 'https://c.d' has been blocked by CORS policy"), "a CORS block is not a JS error");
+  assert.ok(!isJsError("Refused to connect to 'https://x' because it violates the Content Security Policy directive"), "a CSP refusal is not a JS error");
+  console.log("selftest OK: click-error classifier separates thrown JS from browser-logged network failures");
+}
+
+// a11y findings must name the offending elements, and the axe boilerplate must go.
+{
+  assert.strictEqual(tidyWhy("Fix any of the following:\n  Element has insufficient color contrast of 2.5 (foreground #fff, background #eee)"),
+    "Element has insufficient color contrast of 2.5 (foreground #fff, background #eee)", "the ceremony line is dropped, the measurement kept");
+  assert.strictEqual(tidyWhy("Fix all of the following:\n  aria-label attribute is empty\n  Element has no title attribute"),
+    "aria-label attribute is empty; Element has no title attribute", "multiple causes join on one line");
+  assert.ok(tidyWhy("x".repeat(500)).length <= 240, "a runaway summary is capped");
+  console.log("selftest OK: a11y failure summaries keep the measurement and drop the boilerplate");
 }
 
 // Page-type inference: structural rules must classify the common shapes.

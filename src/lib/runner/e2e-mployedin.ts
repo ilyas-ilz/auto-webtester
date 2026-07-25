@@ -13,7 +13,7 @@ const mk = (name: string, username: string, password: string): RoleCred => ({ id
 const project: Project = {
   id: nanoid(),
   name: "mployedin",
-  baseUrl: "https://mployedin-8a4rc.ondigitalocean.app",
+  baseUrl: "https://mployedin-app-jr8h5.ondigitalocean.app",
   envTag: "staging",
   loginPath: "/en/login",
   registerPath: "",
@@ -37,7 +37,7 @@ const project: Project = {
 async function main(): Promise<void> {
   createProject(project);
   console.log(`\n▶ mployedin smart run starting (${project.roles.length} roles)...\n`);
-  const runId = await runProject(project, "smart");
+  const runId = await runProject(project, "full");
 
   const events = listEvents(runId);
   const findings = listFindings(runId);
