@@ -69,6 +69,23 @@ CREATE TABLE IF NOT EXISTS graph_edges (
   type TEXT NOT NULL,
   UNIQUE(project_id, from_node, to_node, type)
 );
+CREATE TABLE IF NOT EXISTS contracts (
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  kind TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  expected INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  UNIQUE(project_id, kind, subject)
+);
+CREATE TABLE IF NOT EXISTS lifecycle_transitions (
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  entity_type TEXT NOT NULL,
+  action TEXT NOT NULL,
+  from_status TEXT NOT NULL,
+  to_status TEXT NOT NULL,
+  actor_role TEXT NOT NULL,
+  UNIQUE(project_id, entity_type, action, from_status, to_status, actor_role)
+);
 CREATE INDEX IF NOT EXISTS idx_events_run ON run_events(run_id);
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_findings_fp ON findings(fingerprint);
@@ -90,6 +107,10 @@ addColumn("runs", "report_json TEXT");
 addColumn("findings", "kind TEXT NOT NULL DEFAULT 'bug'");
 addColumn("findings", "source TEXT NOT NULL DEFAULT 'deterministic'");
 addColumn("findings", "confidence REAL NOT NULL DEFAULT 1.0");
+// graph_edges relationship-ready (Plan-v7 §3.3): per-edge facts + confidence, so
+// typed relationships (created_by/belongs_to/applied_to) carry ownership/effect data.
+addColumn("graph_edges", "attrs_json TEXT NOT NULL DEFAULT '{}'");
+addColumn("graph_edges", "confidence REAL NOT NULL DEFAULT 1.0");
 addColumn("findings", "fingerprint TEXT NOT NULL DEFAULT ''");
 addColumn("projects", "register_path TEXT NOT NULL DEFAULT ''");
 addColumn("projects", "test_inbox_url TEXT NOT NULL DEFAULT ''");
@@ -242,6 +263,12 @@ export function updateRun(id: string, fields: Partial<Pick<Run, "status" | "fini
   db.prepare(`UPDATE runs SET ${sets.join(", ")} WHERE id = ?`).run(...vals);
 }
 
+/** Most recent non-running run across all projects — the report CLI's default target. */
+export function latestFinishedRunId(): string | null {
+  const row = db.prepare("SELECT id FROM runs WHERE status != 'running' ORDER BY startedAt DESC LIMIT 1").get() as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
 export function getRun(id: string): Run | null {
   const r = db.prepare(`SELECT * FROM runs WHERE id = ?`).get(id) as Record<string, unknown> | undefined;
   return r ? rowToRun(r) : null;
@@ -371,9 +398,15 @@ export function upsertGraphNode(n: Omit<GraphNode, "id">): number {
 }
 
 export function upsertGraphEdge(e: Omit<GraphEdge, "id">): void {
+  // Re-observing an edge updates its facts/confidence (last-write-wins; confidence
+  // merging is lifecycle-learning territory, not the foundation). Older callers
+  // that omit attrs/confidence get the '{}'/1.0 defaults.
   db.prepare(
-    `INSERT OR IGNORE INTO graph_edges (project_id, from_node, to_node, type) VALUES (?, ?, ?, ?)`
-  ).run(e.projectId, e.fromNode, e.toNode, e.type);
+    `INSERT INTO graph_edges (project_id, from_node, to_node, type, attrs_json, confidence)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(project_id, from_node, to_node, type) DO UPDATE SET
+       attrs_json = excluded.attrs_json, confidence = excluded.confidence`
+  ).run(e.projectId, e.fromNode, e.toNode, e.type, JSON.stringify(e.attrs ?? {}), e.confidence ?? 1.0);
 }
 
 function rowToNode(r: Record<string, unknown>): GraphNode {
@@ -397,12 +430,55 @@ export function listGraphNodes(projectId: string, type?: GraphNodeType): GraphNo
 }
 
 export function listGraphEdges(projectId: string): GraphEdge[] {
-  return (db.prepare(`SELECT id, project_id as projectId, from_node as fromNode, to_node as toNode, type FROM graph_edges WHERE project_id = ?`)
-    .all(projectId) as GraphEdge[]);
+  const rows = db.prepare(`SELECT id, project_id as projectId, from_node as fromNode, to_node as toNode, type, attrs_json as attrsJson, confidence FROM graph_edges WHERE project_id = ?`)
+    .all(projectId) as (Omit<GraphEdge, "attrs"> & { attrsJson: string })[];
+  return rows.map(({ attrsJson, ...e }) => ({ ...e, attrs: JSON.parse(attrsJson) }));
 }
 
 export function graphSummary(projectId: string): { pages: number; apis: number } {
   const pages = (db.prepare(`SELECT COUNT(*) as c FROM graph_nodes WHERE project_id = ? AND type = 'page'`).get(projectId) as { c: number }).c;
   const apis = (db.prepare(`SELECT COUNT(*) as c FROM graph_nodes WHERE project_id = ? AND type = 'api'`).get(projectId) as { c: number }).c;
   return { pages, apis };
+}
+
+// Behavioral contracts (Plan-v7 §3.7) — the first clean run freezes a semantic
+// invariant; later runs read it back to validate as a regression oracle. Shape kept
+// db-local (kind/subject/expected) so db.ts stays free of runner types; the runner maps
+// kind to its ContractKind union. Upsert is idempotent — re-freezing the same invariant
+// is a no-op, never a second row.
+export interface StoredContract { kind: string; subject: string; expected: boolean }
+
+export function saveContract(projectId: string, c: StoredContract): void {
+  db.prepare(
+    `INSERT INTO contracts (project_id, kind, subject, expected, created_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(project_id, kind, subject) DO NOTHING`,
+  ).run(projectId, c.kind, c.subject, c.expected ? 1 : 0, new Date().toISOString());
+}
+
+export function getContract(projectId: string, kind: string, subject: string): StoredContract | null {
+  const r = db.prepare(`SELECT kind, subject, expected FROM contracts WHERE project_id = ? AND kind = ? AND subject = ?`)
+    .get(projectId, kind, subject) as { kind: string; subject: string; expected: number } | undefined;
+  return r ? { kind: r.kind, subject: r.subject, expected: !!r.expected } : null;
+}
+
+// Observed lifecycle transitions accumulated across runs (Plan-v7 §3.3). The learning
+// agent judges a run's transitions against a model learned from THIS history (prior
+// known-good), which is what lets backward/wrong-role fire — a single run only ever sees
+// the post-terminal red flag. Row shape is db-local; the runner maps it to Transition.
+export interface StoredTransition { entityType: string; action: string; from: string; to: string; actorRole: string }
+
+export function saveTransitions(projectId: string, transitions: readonly StoredTransition[]): void {
+  const stmt = db.prepare(
+    `INSERT INTO lifecycle_transitions (project_id, entity_type, action, from_status, to_status, actor_role)
+     VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+  );
+  const tx = db.transaction((rows: readonly StoredTransition[]) => {
+    for (const t of rows) stmt.run(projectId, t.entityType, t.action, t.from, t.to, t.actorRole);
+  });
+  tx(transitions);
+}
+
+export function listTransitions(projectId: string): StoredTransition[] {
+  return (db.prepare(`SELECT entity_type as entityType, action, from_status as "from", to_status as "to", actor_role as actorRole FROM lifecycle_transitions WHERE project_id = ?`)
+    .all(projectId) as StoredTransition[]);
 }

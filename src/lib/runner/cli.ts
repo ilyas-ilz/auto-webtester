@@ -1,3 +1,5 @@
+import { loadEnvLocal } from "./env";
+loadEnvLocal(); // tsx doesn't load .env.local — without this, CLI runs always had the AI layer off
 import { nanoid } from "nanoid";
 import type { Project, RoleCred, RunMode } from "../types";
 import { createProject, listFindings } from "../db";

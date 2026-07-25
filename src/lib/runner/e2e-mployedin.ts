@@ -1,6 +1,8 @@
 // One-off e2e verifier — creates the mployedin project with all 5 roles, runs a
 // smart-mode pass, then prints per-agent activity so we can see each agent did
 // real work (steps + findings), not "just a screenshot". Delete after use.
+import { loadEnvLocal } from "./env";
+loadEnvLocal(); // tsx doesn't load .env.local — without this the AI layer is silently off
 import { nanoid } from "nanoid";
 import type { Project, RoleCred } from "../types";
 import { createProject, listEvents, listFindings } from "../db";

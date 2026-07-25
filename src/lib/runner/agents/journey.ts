@@ -5,6 +5,7 @@ import { aiAvailable, aiToolCall } from "../ai";
 import { UNSAFE } from "./crawler";
 import { crudTag } from "./crud";
 import { expandEdgeTokens } from "../fuzz";
+import { semanticSnapshot } from "../snapshot";
 
 const AGENT = "journey";
 const DEFAULT_MAX_ACTIONS = 30;
@@ -89,21 +90,19 @@ async function applyPersona(page: Page, persona?: Journey["persona"]): Promise<v
   }
 }
 
-/** Extract a capped, labelled digest of visible interactive elements — shared by the journey Navigator and the explorer. */
+/**
+ * Extract a capped, labelled digest of visible interactive elements — shared by
+ * the journey Navigator and the explorer. Sourced from the Plan-v7 §3.1 semantic
+ * snapshot (a11y fused with DOM), so it catches div[onclick]/tabindex controls the
+ * old `[role=button]`-only selector missed and gets W3C-priority accessible names.
+ * Target *resolution* is unchanged — `execute`/`candidates` still resolve by
+ * role/label/text; this only improves what the AI Navigator is shown.
+ */
 export async function pageDigest(page: Page, cap: number = DIGEST_CAP): Promise<string[]> {
-  const raw = await page.evaluate((c: number) => {
-    const sel = "button, a[href], input:not([type=hidden]), select, textarea, [role=button], [role=tab], [role=link], [role=menuitem]";
-    const out: { role: string; name: string }[] = [];
-    for (const el of Array.from(document.querySelectorAll(sel))) {
-      if (out.length >= c) break;
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) continue;
-      const he = el as HTMLElement;
-      const name = (el.getAttribute("aria-label") || he.innerText || el.getAttribute("placeholder") || el.getAttribute("name") || (el as HTMLInputElement).value || "").trim();
-      out.push({ role: el.getAttribute("role") || el.tagName.toLowerCase(), name });
-    }
-    return out;
-  }, cap).catch(() => [] as { role: string; name: string }[]);
+  const snap = await semanticSnapshot(page).catch(() => null);
+  const raw = (snap?.nodes ?? [])
+    .filter((n) => n.interactive && n.visible)
+    .map((n) => ({ role: n.role || n.tag, name: n.name }));
   return buildDigest(raw, cap);
 }
 

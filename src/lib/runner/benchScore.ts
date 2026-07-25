@@ -1,4 +1,4 @@
-import type { Severity } from "../types";
+import type { Severity, AutonomousResolution } from "../types";
 
 // Plan-v6 V9: pure scorer for the seeded-defect benchmark. Matches this run's
 // findings against bench/defects.json and prints the honest numbers the 4th
@@ -112,4 +112,13 @@ export function formatBenchReport(app: string, s: BenchScore): string {
     for (const d of s.missed) lines.push(`    ✗ [${d.id}] (${d.dimension}) ${d.note ?? d.keyword ?? d.path}`);
   }
   return lines.join("\n");
+}
+
+/**
+ * ARR line for the bench console (Plan-v7 §6): unknowns resolved deterministically ÷
+ * unknowns encountered — the actual "brain-like without AI" measure. It should climb as
+ * §3.4/§3.5 land *while AI-calls fall*; detection % alone can't show that.
+ */
+export function formatArr(arr: AutonomousResolution): string {
+  return `  ARR             ${pct(arr.rate)}  (${arr.byProbe} probed + ${arr.byFacts} known / ${arr.encountered} unknowns; ${arr.requiredAI} would need AI, ${arr.unresolved} unresolved)`;
 }

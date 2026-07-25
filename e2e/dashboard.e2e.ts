@@ -19,7 +19,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 
-const BASE = process.env.E2E_BASE_URL ?? "http://localhost:3000";
+const BASE = process.env.E2E_BASE_URL ?? "http://localhost:3400";
 const TARGET = process.env.E2E_TARGET_URL ?? "https://example.com";
 const RUN_TIMEOUT_MS = Number(process.env.E2E_RUN_TIMEOUT_MS ?? 180_000);
 const TERMINAL = new Set(["passed", "failed", "error"]);

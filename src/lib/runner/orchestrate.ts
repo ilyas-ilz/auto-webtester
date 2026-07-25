@@ -22,7 +22,8 @@ import { a11yAgent } from "./agents/a11y";
 import { perfAgent, lighthouseAudit } from "./agents/perf";
 import { uiAuditAgent } from "./agents/uiAudit";
 import { visualAgent } from "./agents/visual";
-import { permissionsAgent, type RoleSession } from "./agents/permissions";
+import { permissionsAgent, writeIdorReplay, relAuthzReplay, type RoleSession } from "./agents/permissions";
+import { learningAgent, sessionPersistsContract } from "./agents/learning";
 import { aiReviewerAgent } from "./agents/aiReviewer";
 import { regressionAgent } from "./agents/regression";
 import { registerAgent } from "./agents/register";
@@ -41,6 +42,8 @@ import { seniorReviewerAgent } from "./agents/seniorReviewer";
 import { resilienceAgent } from "./agents/resilience";
 import { chaosAgent } from "./agents/chaos";
 import { withRecovery } from "./recovery";
+import { aiHealthCheck, aiProviderLabel } from "./ai";
+import { generateReportDocs } from "./report-doc";
 
 const LAUNCHERS = { chromium, firefox, webkit } as const;
 
@@ -173,6 +176,28 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
   const specs = sessionSpecs(project);
   ctx.log("orchestrator", "step", `Run ${runId} started for ${project.name} (${project.baseUrl}) — ${mission.reason}`);
 
+  // AI layer health gate — surfaced FIRST, loudly. A configured-but-dead key
+  // (expired/revoked → 401) used to fail late inside each AI agent; now the
+  // run says up front whether AI review is on, off by mode, or broken.
+  if (mission.useAI) {
+    const health = await aiHealthCheck();
+    if (!health.ok) {
+      mission.useAI = false;
+      mission.aiTokenBudget = 0;
+      ctx.log("orchestrator", "warn", `AI LAYER DOWN — ${aiProviderLabel()} did not answer (${health.error}). Deterministic agents still run; journey/page-judge/ai-reviewer/senior-review are OFF this run.`);
+      ctx.finding({
+        agent: "orchestrator", severity: "high", kind: "improvement", role: null, pageUrl: null,
+        title: "AI layer is configured but unreachable — run downgraded to deterministic-only",
+        detail: `Health check against ${aiProviderLabel()} failed at run start: ${health.error}. Fix the API key in .env.local (ANTHROPIC_API_KEY or OPENROUTER_API_KEY) to restore AI business-logic review, page judging and the senior sign-off. All ~27 deterministic agents still ran normally.`,
+        evidence: null,
+      });
+    } else {
+      ctx.log("orchestrator", "pass", `AI layer healthy via ${aiProviderLabel()} (budget ${mission.aiTokenBudget.toLocaleString()} tokens)`);
+    }
+  } else if (mode !== "quick") {
+    ctx.log("orchestrator", "warn", "AI layer OFF — no ANTHROPIC_API_KEY / OPENROUTER_API_KEY configured. Deterministic agents still run.");
+  }
+
   // Execution dimension (Plan-v2 §4): profiles[0] is the primary (Desktop
   // Chrome) — it gets the full pipeline. Any additional profiles (mobile
   // viewport, other engines) only re-render already-discovered pages; see
@@ -292,6 +317,8 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
       if (newCount || changedCount) ctx.log("orchestrator", "step", `${newCount} new page(s), ${changedCount} changed since last run — prioritized in this run's samples`);
       // Once per run, needs crawl data — tells the report (and AI reviewer) what kind of site this is.
       if (firstRole) await withRecovery(ctx, "site-classifier", () => classifierAgent(ctx, session.browserCtx, project));
+      // §3.7 session-persists contract for the primary authenticated role (read-only reload check).
+      if (firstRole && role.id !== ANON_ROLE.id) await withRecovery(ctx, "learning", () => sessionPersistsContract(ctx, session.browserCtx, project, role, startUrl));
       // Interaction runs early on purpose: routes it discovers by clicking
       // (button-nav SPAs) are adopted into ctx.pages, so every agent below
       // — expectations, a11y, perf, ui, visual — tests them too.
@@ -333,9 +360,20 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
       }
       // CRUD writes (V5): full mode only, non-prod only (guarded inside the agent too).
       if (mode === "full") await withRecovery(ctx, "crud", () => crudAgent(ctx, session.browserCtx, project, role));
+      // Application-intelligence learning (Plan-v7 wave 2 — §3.3/§3.4/§3.5): safe-probe
+      // unknown controls into learned facts + ARR, flag impossible lifecycle transitions.
+      // After crud so a disposable qabot- entity exists; full+non-prod (guarded inside).
+      if (mode === "full") await withRecovery(ctx, "learning", () => learningAgent(ctx, session.browserCtx, project, role, mission.sampleSize));
     }
 
     await withRecovery(ctx, "permissions", () => permissionsAgent(ctx, sessions));
+    // Write-side of the same authz check (§3.2a): replay crud's qabot-tagged
+    // writes from other roles' sessions. Runs after crud has populated
+    // ctx.idorWrites; self-guards to full mode (empty otherwise).
+    await withRecovery(ctx, "permissions", () => writeIdorReplay(ctx, sessions));
+    // Read-side, relationship-aware (§3.2b): GET the created object URLs cross-role —
+    // object-level read-IDOR on entities no crawler ever discovered.
+    await withRecovery(ctx, "permissions", () => relAuthzReplay(ctx, sessions));
 
     // Additional device profiles: fresh login (catches device-specific auth
     // bugs) then re-render the primary crawl's known pages under this
@@ -427,6 +465,7 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
   report.coverageTotals = computeCoverageTotals(ctx.pages, ctx.testedUrls, ctx.coverage); // P4
   report.coverageMatrix = buildCoverageMatrix(ctx.pages, ctx.tested, ctx.pageTypes); // V4
   if (ctx.patterns) report.patterns = ctx.patterns; // P2
+  if (ctx.arr.encountered) report.arr = { ...ctx.arr, rate: (ctx.arr.byFacts + ctx.arr.byProbe) / ctx.arr.encountered }; // §3.5/§6
   if (ctx.traces.length) report.traces = ctx.traces; // V1
   if (ctx.lighthouse.length) report.lighthouse = ctx.lighthouse; // V5
   if (regressionFocus) report.regressionFocus = regressionFocus; // V8
@@ -450,6 +489,14 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
   const summary = [headline, ...sessionLines, ...digestLines(findings)].join("\n");
   updateRun(runId, { status, finishedAt: new Date().toISOString(), summary, aiTokens, reportJson: JSON.stringify(report) });
   ctx.log("orchestrator", status === "passed" ? "pass" : "fail", headline);
+  // Plain-language deliverables: data/reports/<runId>.md + .pdf — role-by-role,
+  // agent-by-agent, written so a non-engineer can read what happened and why.
+  try {
+    const out = await generateReportDocs(runId);
+    if (out) ctx.log("orchestrator", "step", `Detailed report written: ${out.md}${out.pdf ? ` + ${out.pdf}` : ""}`);
+  } catch (e) {
+    ctx.log("orchestrator", "warn", `Report generation failed: ${String(e).slice(0, 160)}`);
+  }
 }
 
 /**

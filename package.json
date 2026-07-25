@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3400",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -p 3400",
     "lint": "eslint",
     "agents": "tsx src/lib/runner/cli.ts",
     "agents:test": "tsx src/lib/runner/selftest.ts",
+    "report": "tsx src/lib/runner/report-cli.ts",
     "bench": "tsx bench/run.ts",
     "ui:e2e": "tsx e2e/dashboard.e2e.ts"
   },

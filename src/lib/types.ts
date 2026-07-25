@@ -88,6 +88,17 @@ export interface RunReport {
   lighthouse?: LighthouseResult[]; // one entry per audited representative page (V5)
   rootCauseHints?: RootCauseHint[]; // AI-located probable source of the worst findings (V7) — only when repoPath is set
   regressionFocus?: RegressionFocus; // routes prioritized because their files changed in git since the last run (V8)
+  arr?: AutonomousResolution; // how many unknown effects got resolved deterministically vs needing AI (Plan-v7 §6)
+}
+
+/** Autonomous Resolution Rate (Plan-v7 §6) — unknowns resolved without AI ÷ unknowns encountered. */
+export interface AutonomousResolution {
+  encountered: number;
+  byFacts: number; // already a known fact (no probe, no AI)
+  byProbe: number; // learned by a safe reversible probe (§3.5)
+  requiredAI: number; // would have to escalate to AI
+  unresolved: number; // neither known, probeable, nor AI-available
+  rate: number; // (byFacts+byProbe)/encountered
 }
 
 /** Probable source location of a finding (Plan-v6 V7) — AI-matched against the project's own repo. */
@@ -199,7 +210,10 @@ export interface Finding {
 // Feature/Entity/State/Workflow modeling is deferred — real value (route map,
 // API surface, risk order) without building a full semantic model up front.
 
-export type GraphNodeType = "page" | "api";
+// "state"/"entity" added for the Plan-v7 §3.3 lifecycle graph (state = a canonical
+// UI state key; entity = a learned business object). No consumer records them yet —
+// the write path is relationship-ready ahead of the learning layer.
+export type GraphNodeType = "page" | "api" | "state" | "entity";
 
 export interface GraphNode {
   id: number;
@@ -212,7 +226,12 @@ export interface GraphNode {
   lastSeenRun: string;
 }
 
-export type GraphEdgeType = "navigates_to" | "calls";
+// created_by/belongs_to/applied_to = the typed relationships §3.2b reads ownership
+// and tenancy off (Plan-v7 §3.3, "relationship-ready from day one"); transitions_to =
+// a learned state→state lifecycle edge. Added now so 3.2b needs no schema migration.
+export type GraphEdgeType =
+  | "navigates_to" | "calls"
+  | "created_by" | "belongs_to" | "applied_to" | "transitions_to";
 
 export interface GraphEdge {
   id: number;
@@ -220,6 +239,8 @@ export interface GraphEdge {
   fromNode: number;
   toNode: number;
   type: GraphEdgeType;
+  attrs?: Record<string, unknown>; // per-edge facts: actorRole, preconditions[], observedEffects[]… (§3.3)
+  confidence?: number; // 0..1, how strongly we believe this edge (defaults 1.0 for directly-observed)
 }
 
 // ---- Site profile (what kind of site is this?) ----

@@ -39,6 +39,69 @@ interface MediaResult {
   networkState: number; // 3 = NETWORK_NO_SOURCE
 }
 
+// Search/filter inputs the click-explorer can't exercise — typing is the only
+// way to prove a search box actually searches.
+const SEARCHABLE = 'input[type="search"], [role="searchbox"], input[placeholder*="search" i], input[placeholder*="filter" i], input[aria-label*="search" i], input[name*="search" i], input[name*="query" i], input[name="q"]';
+
+/**
+ * Types a query into up to `max` search/filter boxes on the page and watches
+ * for ANY observable reaction: URL change (query param), DOM delta, or a new
+ * same-origin network request. A search box that reacts to none of those is
+ * reported — "the box renders but searching does nothing" is exactly the class
+ * of bug users notice first.
+ */
+async function probeSearchBoxes(ctx: RunContext, page: Page, role: RoleCred, pageUrl: string, max = 2): Promise<number> {
+  const boxes = await page.locator(SEARCHABLE).all();
+  let probed = 0;
+  for (const box of boxes) {
+    if (probed >= max) break;
+    if (!(await box.isVisible().catch(() => false)) || !(await box.isEditable().catch(() => false))) continue;
+    probed++;
+    const label = ((await box.getAttribute("placeholder").catch(() => "")) || (await box.getAttribute("aria-label").catch(() => "")) || (await box.getAttribute("name").catch(() => "")) || "search").slice(0, 50);
+    ctx.status(AGENT, `Typing "a" into search box "${label}" as ${role.name}`, { url: pageUrl });
+
+    const urlBefore = page.url();
+    const nodesBefore = await page.evaluate(() => document.querySelectorAll("*").length).catch(() => 0);
+    let sawRequest = false;
+    const onReq = (req: { url(): string }): void => {
+      try { if (new URL(req.url()).origin === new URL(urlBefore).origin) sawRequest = true; } catch { /* data:/blob: */ }
+    };
+    page.on("request", onReq);
+    try {
+      await box.click({ timeout: 3000 });
+      await box.fill("a", { timeout: 3000 }); // single letter: matches something on almost any dataset
+      await page.waitForTimeout(900); // debounce window for type-ahead filters
+      await box.press("Enter").catch(() => {});
+      await page.waitForTimeout(1200);
+    } catch {
+      page.off("request", onReq);
+      continue; // box disappeared / covered — not a finding
+    }
+    page.off("request", onReq);
+
+    const nodesAfter = await page.evaluate(() => document.querySelectorAll("*").length).catch(() => nodesBefore);
+    const reacted = page.url() !== urlBefore || Math.abs(nodesAfter - nodesBefore) >= 2 || sawRequest;
+    if (!reacted) {
+      ctx.finding({
+        agent: AGENT, severity: "medium", confidence: 0.7, role: role.name, pageUrl,
+        title: `Search/filter box "${label}" does not search`,
+        detail: `Typed "a" and pressed Enter in this input: no navigation, no URL change, no DOM change, and no network request followed within ~2s. The box renders but appears to be wired to nothing.`,
+        evidence: await ctx.screenshot(page, `${role.name}-dead-search-${label}`),
+      });
+    } else {
+      ctx.log(AGENT, "pass", `Search box "${label}" reacts (${page.url() !== urlBefore ? "navigated" : sawRequest ? "fired request" : "DOM updated"}) on ${pageUrl}`);
+    }
+    // Reset for the next probe on this page.
+    if (page.url() !== urlBefore) {
+      await page.goBack({ timeout: 10000 }).catch(() => {});
+      await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+    } else {
+      await box.fill("").catch(() => {});
+    }
+  }
+  return probed;
+}
+
 /** Mute + play each <audio>/<video> in-page and report whether time actually advances. */
 async function probeMedia(page: Page): Promise<MediaResult[]> {
   return page.evaluate(async () => {
@@ -78,7 +141,7 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
     return;
   }
 
-  let clicks = 0, deadControls = 0, routesFound = 0, mediaChecked = 0, explored = 0, adopted = 0;
+  let clicks = 0, deadControls = 0, routesFound = 0, mediaChecked = 0, explored = 0, adopted = 0, searchesProbed = 0;
   const known = new Set(ctx.pages.filter((p) => p.role === role.name).map((p) => p.url));
   const perTemplate = new Map<string, number>();
   const queue = [...pages];
@@ -122,6 +185,9 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
           ctx.log(AGENT, "pass", `Media plays: ${label} (t=${m.currentTime.toFixed(1)}s) on ${crawled.url}`);
         }
       }
+
+      // --- search/filter probe ---
+      searchesProbed += await probeSearchBoxes(ctx, page, role, crawled.url).catch(() => 0);
 
       // --- click exploration ---
       const startUrl = page.url();
@@ -201,5 +267,5 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
   }
 
   ctx.coverage.controlsClicked += clicks; // P4 coverage: controls actually exercised
-  ctx.log(AGENT, "pass", `Explored ${explored} page(s) for ${role.name}: ${clicks} clicks, ${routesFound} click-only route(s) discovered (${adopted} adopted into page set), ${deadControls} suspect dead control(s), ${mediaChecked} media element(s) probed`);
+  ctx.log(AGENT, "pass", `Explored ${explored} page(s) for ${role.name}: ${clicks} clicks, ${routesFound} click-only route(s) discovered (${adopted} adopted into page set), ${deadControls} suspect dead control(s), ${mediaChecked} media element(s) probed, ${searchesProbed} search box(es) exercised`);
 }

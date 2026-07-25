@@ -5,6 +5,7 @@ import type { Page, BrowserContext } from "playwright";
 import { addEvent, addFinding } from "../db";
 import type { Finding, RunEvent, Severity, SiteProfile, RunReport, RootCauseCluster, LighthouseResult } from "../types";
 import { rankPages } from "./graph";
+import { FactStore } from "./facts";
 
 export interface CrawledPage {
   url: string;
@@ -33,6 +34,20 @@ export interface ApiSample {
   body: unknown;
 }
 
+// A state-mutating request captured during a create/delete so a later cross-role
+// session can replay it (Plan-v7 §3.2a write-IDOR). Only ever recorded for
+// requests carrying our qabot- tag, so a replay can never touch real data.
+export interface CapturedWrite {
+  method: string;
+  url: string;
+  postData: string | null;
+  contentType: string | null; // original request content-type, replayed verbatim so form/JSON bodies aren't mis-sent
+  csrfHeader: string | null; // name of the CSRF/XSRF request header the owner sent, if any (Plan-v7 §8.1) — replay injects the replaying role's OWN token into it so a denial means authz, not a token mismatch
+  ownerRole: string; // whose session performed (and owns the target of) this write
+  ownerStatus: number; // status the owner's own write returned — the 2xx baseline the oracle needs
+  tag: string; // the qabot- value proving the target is a disposable entity we created
+}
+
 type FindingInput = Omit<Finding, "id" | "runId" | "kind" | "source" | "confidence" | "fingerprint"> &
   Partial<Pick<Finding, "kind" | "source" | "confidence" | "fingerprint">>;
 
@@ -46,6 +61,12 @@ export class RunContext {
   pages: CrawledPage[] = [];
   apiCalls: ApiCall[] = [];
   apiSamples: ApiSample[] = []; // captured JSON response bodies for the api-validation agent (Plan-v5 R4)
+  idorWrites: CapturedWrite[] = []; // qabot-tagged mutating writes captured by crud, for the cross-role write-IDOR replay (Plan-v7 §3.2a)
+  facts = new FactStore(); // learned app-behavior facts (Plan-v7 §3.4) — gates §3.5 probing; finding ≠ fact
+  // Autonomous Resolution Rate accounting (Plan-v7 §6): every unknown effect the learning
+  // agent meets, split by how it got resolved. ARR = (byFacts+byProbe)/encountered — the
+  // real "brain-like without AI" measure; it should climb while requiredAI falls.
+  arr = { encountered: 0, byFacts: 0, byProbe: 0, requiredAI: 0, unresolved: 0 };
   analyticsHits = new Set<string>(); // analytics/telemetry provider labels seen firing during discovery (Plan-v5 R7)
   siteProfile: SiteProfile | null = null;
   pageTypes = new Map<string, string>(); // url → inferred page type (filled by page-expectations)

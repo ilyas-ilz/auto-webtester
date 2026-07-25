@@ -18,6 +18,31 @@ export function aiProviderLabel(): string {
   return "none";
 }
 
+/**
+ * Proves the configured AI provider actually answers (a key can exist but be
+ * dead — expired/revoked keys return 401 and every agent call would fail
+ * late and quietly). One ~10-token completion; called once at run start.
+ */
+export async function aiHealthCheck(): Promise<{ ok: boolean; error: string | null }> {
+  if (!aiAvailable()) return { ok: false, error: "no API key configured" };
+  try {
+    if (process.env.ANTHROPIC_API_KEY) {
+      const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+      await client.messages.create({ model: ANTHROPIC_MODEL, max_tokens: 4, messages: [{ role: "user", content: "ping" }] });
+      return { ok: true, error: null };
+    }
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: OPENROUTER_MODEL, max_tokens: 4, messages: [{ role: "user", content: "ping" }] }),
+    });
+    if (!res.ok) return { ok: false, error: `OpenRouter ${res.status}: ${(await res.text()).slice(0, 160)}` };
+    return { ok: true, error: null };
+  } catch (e) {
+    return { ok: false, error: String(e).slice(0, 200) };
+  }
+}
+
 export interface AiToolRequest {
   maxTokens: number;
   tool: { name: string; description: string; schema: Record<string, unknown> };
