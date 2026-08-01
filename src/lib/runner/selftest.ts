@@ -1,12 +1,19 @@
 import assert from "node:assert";
+import { isRunAbandoned } from "../db";
+import { absorbRootCauseMembers, buildReportMarkdown } from "./report-doc";
 import { UNSAFE, urlTemplate } from "./agents/crawler";
-import { shouldAdoptRoute, isJsError } from "./agents/interaction";
+import { shouldAdoptRoute, isJsError, clickDidNothing, searchVerdict, type SearchProbeSample } from "./agents/interaction";
 import { tidyWhy } from "./agents/a11y";
 import { inferPageType } from "./agents/expectations";
+import { plainImpact } from "../plain";
 import { encrypt, decrypt, fingerprint } from "../crypto";
 import { riskScore } from "./graph";
 import { diffByFingerprint } from "./agents/regression";
 import { withRecovery, classifyObservation, isTrustworthy, observe, type ObservationQuality } from "./recovery";
+import { decideRunStatus } from "./verdict";
+import { deriveAgentView } from "../report-view";
+import { RunCancelledError, modifierMask, keyInfo, isNavigable, grabControl, releaseControl, humanHasControl, claimLiveOwner, setLiveSession, liveOwnerKey } from "./control";
+import { controlAllowed } from "../originGuard";
 import { learnLifecycle, lifecycleViolations, type Transition } from "./lifecycle";
 import { FactStore, type Fact } from "./facts";
 import { shouldProbe, resolveStrategy, factFromProbe, learnFromProbe, classifyControl, planProbes, runProbePlan, type ProbeOutcome, type ProbeTarget, type ProbeIO, type ProbePlanItem } from "./probe";
@@ -14,19 +21,19 @@ import { freezeContract, checkContract, type Observation } from "./contracts";
 import { profilesForMode, PRIMARY_PROFILE } from "./devices";
 import { reorderByChangeStatus } from "./graph";
 import { classifyCurrencyFormat, classifyDateFormat } from "./agents/dataIntegrity";
-import { diffBaseline } from "./agents/visual";
+import { diffBaseline, baselineKey } from "./agents/visual";
 import { AI_BUDGET_BY_MODE } from "./planner";
 import { genTestEmail, extractOtp, extractVerifyLink } from "./agents/register";
 import { crudTag, isWriteMethod, isReplayableWrite, classifyWriteIdor } from "./agents/crud";
-import { findOutliers } from "./agents/uiAudit";
-import { pickLoginError } from "./agents/login";
+import { findOutliers, tooSmallTaps, overlapRatio, OVERLAP_THRESHOLD } from "./agents/uiAudit";
+import { pickLoginError, parseCredentialAnswer } from "./agents/login";
 import { orderForReplay, relationshipOf, classifyRelAuthz, replayIsolation } from "./agents/permissions";
 import { parseZapAlerts } from "./agents/security";
 import { buildRunReport, computeCoverageTotals, buildCoverageMatrix } from "./orchestrate";
 import { rankPages } from "./graph";
 import { clusterFailures } from "./agents/rootCause";
 import { FUZZ_CATALOGUE, genFuzzInput, looksReflectedXss, expandEdgeTokens, type FuzzKind } from "./fuzz";
-import { stripTarget, buildDigest, isDestructiveStep, expandTokens, RESOLVE_ORDER } from "./agents/journey";
+import { stripTarget, buildDigest, isDestructiveStep, expandTokens, matchGoal, RESOLVE_ORDER } from "./agents/journey";
 import { classifyReaction } from "./agents/resilience";
 import { isSafeChaosControl, CHAOS_CONDITIONS } from "./agents/chaos";
 import { auditSeoTags, type SeoSignals } from "./agents/seo";
@@ -39,7 +46,17 @@ import { fileToRoute, routesMatch, matchRouteToFiles, mapChangedFilesToPaths } f
 import { scoreBench, formatArr, type SeededDefect, type BenchFinding } from "./benchScore";
 import { accountArr, statusTransition, transitionKey } from "./agents/learning";
 import { implicitRole, chooseName, computeRef, isInteresting, enrich, normName, canonicalStateKey, interactiveShape, isStateCollision, type SemanticNode, type SemanticSnapshot } from "./snapshot";
-import type { CrawledPage, ApiSample } from "./context";
+import { RunContext, type CrawledPage, type ApiSample } from "./context";
+import { generalizeSubject, mergeExperience, contradictRows, computeGlobalPromotions, recallFacts, summarizeForPrompt, recallRecoveryStrategy, type ExperienceInput } from "./experience";
+import type { ExperienceRow } from "../db";
+import { normalizeForFingerprint, partitionByFeedback, type FeedbackEntry } from "./feedback";
+import { OWASP_CATEGORIES, CWE_TO_OWASP, owaspForCwe, buildOwaspCoverage, parseNpmAudit } from "./owasp";
+import { isSafeProbeUsername } from "./agents/login";
+import { parseAiRoute, resolveRoutedModel, validateToolOutput } from "./ai";
+import { classifyVerifyResult, crossModelVerify } from "./agents/aiReviewer";
+import { judgeShotFractions, pickJudgeTargets } from "./agents/pageJudge";
+import type { Finding, Run, RunReport } from "../types";
+import { targetOriginAllowed } from "../originGuard";
 
 // Security-critical: the read-only crawler must NEVER follow links that end the
 // session or mutate data. If this regex regresses, the crawler could log itself
@@ -128,6 +145,31 @@ console.log("selftest OK: crawler URL templates collapse sibling pages");
   console.log("selftest OK: page-type inference classifies error/search/detail/article/list/form/landing");
 }
 
+// Search probe: reacting is not searching. A matching term and a nonsense term
+// must produce different results before the box counts as working.
+{
+  const s = (over: Partial<SearchProbeSample> = {}): SearchProbeSample => ({ url: "https://x/list", itemCount: 20, textLen: 1000, sawQueryRequest: false, ...over });
+  assert.strictEqual(searchVerdict(s(), s(), s()), "dead", "no change from either query is a dead box");
+  assert.strictEqual(searchVerdict(s(), s({ sawQueryRequest: true }), s({ sawQueryRequest: true })), "ignores-query",
+    "firing a request but returning identical rows for a real and a nonsense term is not searching");
+  assert.strictEqual(searchVerdict(s(), s({ itemCount: 6, textLen: 300 }), s({ itemCount: 0, textLen: 40 })), "works",
+    "different result sizes for the two terms means the query is filtering");
+  assert.strictEqual(searchVerdict(s({ itemCount: 0, textLen: 200 }), s({ itemCount: 0, textLen: 200, sawQueryRequest: true }), s({ itemCount: 0, textLen: 200, sawQueryRequest: true })), "inconclusive",
+    "nothing countable on the page means no verdict, not a finding");
+  console.log("selftest OK: search probe separates dead boxes, query-ignoring boxes, and real filtering");
+}
+
+// Plain-language layer: findings must read as consequences, not as evidence.
+{
+  const p = (agent: string, title: string, detail = ""): string => plainImpact({ agent, title, detail });
+  assert.match(p("route-health", "Server error 504 on /en/admin/users", "Route returned HTTP 504."), /page is down/i, "a 5xx reads as 'the page is down'");
+  assert.match(p("perf", "Very slow page load (16.1s)", "loadEventEnd at 16073ms."), /9 seconds|give up/i, "a slow load reads as users leaving");
+  assert.match(p("a11y", "a11y: Buttons must have discernible text (button-name)", "7 element(s) affected."), /blind|screen reader/i, "button-name reads as unusable for blind users");
+  assert.match(p("interaction", 'Search/filter box "x" ignores the query', ""), /does not actually search/i, "a query-ignoring box reads as a broken search");
+  assert.strictEqual(p("orchestrator", "Run finished", "12 pages"), "", "no pattern match yields no plain line, not a wrong one");
+  console.log("selftest OK: plain-language layer turns finding evidence into user-facing consequences");
+}
+
 // Credential vault: password must round-trip and must not be stored as plaintext.
 const secret = "correct horse battery staple";
 const enc = encrypt(secret);
@@ -157,15 +199,258 @@ console.log("selftest OK: risk scoring prioritizes auth/payment routes");
 
 // Recovery middleware (§3.5): retry once, then report-and-continue (never throw).
 (async () => {
-  const noop = { log: () => {}, agentsRan: new Set<string>(), findingCounts: new Map<string, number>() };
+  const noop = { runId: "selftest", log: () => {}, agentsRan: new Set<string>(), agentsFailed: new Map<string, string>(), findingCounts: new Map<string, number>(), checkCancelled: () => {}, skipCompleted: () => false };
   let calls = 0;
   const recovered = await withRecovery(noop, "t", async () => { calls++; if (calls < 2) throw new Error("flake"); return "done"; });
   assert.strictEqual(recovered, "done", "recovery must return the value produced on retry");
   assert.strictEqual(calls, 2, "recovery must retry exactly once");
   const gaveUp = await withRecovery(noop, "t", async () => { throw new Error("always fails"); });
   assert.strictEqual(gaveUp, null, "recovery must return null once retries are exhausted, not throw");
+  assert.ok(noop.agentsFailed.has("t"), "an exhausted agent must be recorded in agentsFailed (P0-2), not forgotten");
+  assert.ok((noop.agentsFailed.get("t") ?? "").includes("always fails"), "the failure reason must be preserved");
   console.log("selftest OK: recovery retries once then reports-and-continues");
+
+  // Stop button: a cancel unwinds the run instead of being retried like a flake.
+  let cancelCalls = 0;
+  const cancelling = { ...noop, checkCancelled: () => {} };
+  await assert.rejects(
+    withRecovery(cancelling, "t", async () => { cancelCalls++; throw new RunCancelledError(); }),
+    (e: unknown) => e instanceof RunCancelledError,
+    "cancel must propagate out of withRecovery",
+  );
+  assert.strictEqual(cancelCalls, 1, "cancel must not be retried");
+  const gate = { ...noop, checkCancelled: () => { throw new RunCancelledError(); } };
+  await assert.rejects(withRecovery(gate, "t", async () => "never runs"), (e: unknown) => e instanceof RunCancelledError, "cancel gate must stop the next agent from starting");
+  console.log("selftest OK: stop request unwinds the run and is never retried");
+
+  // Interactive live view: the human hand-off gate. withRecovery must hold the
+  // next agent while a human drives, and let go the moment they release.
+  grabControl("selftest");
+  assert.ok(humanHasControl("selftest"), "a hold must give the human the wheel");
+  let ran = false;
+  const held = withRecovery(noop, "t", async () => { ran = true; return "ok"; });
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok(!ran, "no agent may start while a human holds the wheel");
+  releaseControl("selftest");
+  assert.strictEqual(await held, "ok", "the agent must run once the human releases");
+  assert.ok(!humanHasControl("selftest"), "release must drop the lease");
+  console.log("selftest OK: human control gate holds agents, then hands back");
 })();
+
+// Verdict policy (WEBTESTER-AUDIT P0-2 + P1-12): what may fail a run, and when a
+// PASS is honest.
+{
+  const bug = (severity: "critical" | "high" | "medium", fingerprint: string) => ({ severity, kind: "bug" as const, fingerprint });
+  const none = new Set<string>();
+  assert.strictEqual(decideRunStatus([bug("critical", "a")], none, none, 0).status, "failed", "an unsuppressed critical bug fails the run");
+  assert.strictEqual(decideRunStatus([bug("medium", "a")], none, none, 0).status, "passed", "medium findings are advisory, not failures");
+  assert.strictEqual(decideRunStatus([bug("critical", "a")], new Set(["a"]), none, 0).status, "passed", "a human-suppressed false positive must not keep failing every run (P1-12)");
+  assert.strictEqual(decideRunStatus([bug("high", "a")], none, new Set(["a"]), 0).status, "passed", "a cross-model-refuted finding must not affect status (P1-12)");
+  assert.strictEqual(decideRunStatus([{ severity: "high", kind: "improvement", fingerprint: "a" }], none, none, 0).status, "passed", "a high-severity improvement is not a product failure (P1-12)");
+  assert.strictEqual(decideRunStatus([], none, none, 2).status, "inconclusive", "failed agents make the verdict inconclusive, never a silent PASS (P0-2)");
+  assert.strictEqual(decideRunStatus([bug("critical", "a")], none, none, 2).status, "failed", "a real critical bug outranks infrastructure failure — FAIL wins over inconclusive");
+  assert.strictEqual(decideRunStatus([bug("critical", "a")], new Set(["a"]), none, 1).status, "inconclusive", "suppressed finding + failed agent = inconclusive, not passed");
+  console.log("selftest OK: verdict policy — suppression/refutation respected, failed agents block silent PASS");
+}
+
+// Journey goal oracle (WEBTESTER-AUDIT P0-3): Unicode-aware, no silent auto-pass.
+{
+  assert.strictEqual(matchGoal("Your order was placed successfully", "order placed"), "confirmed", "goal words on the page confirm");
+  assert.strictEqual(matchGoal("Page not found", "order placed successfully"), "absent", "missing goal words are absent, not a pass");
+  assert.strictEqual(matchGoal("تم إنشاء الطلب بنجاح", "إنشاء الطلب"), "confirmed", "Arabic goals are actually checked (old [a-z]{4,} auto-passed them)");
+  assert.strictEqual(matchGoal("something else entirely", "تأكيد الحجز"), "absent", "Arabic goal absent from an English page must NOT auto-pass");
+  assert.strictEqual(matchGoal("whatever", "OK #1!"), "unverifiable", "a goal with no matchable words is unverifiable — never silently confirmed");
+  console.log("selftest OK: journey goal oracle — locale-aware matching, no auto-pass on unmatchable goals");
+}
+
+// AI tool-output runtime validation (WEBTESTER-AUDIT P1-10): a cast is not a check.
+{
+  const schema = { type: "object", required: ["severity", "items"], properties: { severity: { type: "string" }, items: { type: "array" }, note: { type: "string" } } };
+  assert.ok(validateToolOutput({ severity: "high", items: [] }, schema), "a conforming payload validates");
+  assert.ok(!validateToolOutput({ severity: "high" }, schema), "a missing required key fails validation");
+  assert.ok(!validateToolOutput({ severity: 5, items: [] }, schema), "a wrong-typed required key fails validation");
+  assert.ok(!validateToolOutput(null, schema), "null is not a tool payload");
+  assert.ok(!validateToolOutput([1, 2], schema), "an array is not a tool payload object");
+  assert.ok(validateToolOutput({ severity: "high", items: [], extra: true }, schema), "unknown extra keys are tolerated");
+  console.log("selftest OK: AI tool outputs are runtime-validated against their own schema");
+}
+
+// Shared report view (WEBTESTER-AUDIT P1-17): dashboard and Markdown derive
+// ran/skipped from ONE function — the stale senior-review case can't recur.
+{
+  const report = { agentsRan: ["crawler"], agentsSkipped: [{ name: "senior-review", reason: "AI off" }, { name: "visual", reason: "quick mode" }] };
+  const view = deriveAgentView(report, ["senior-review"]);
+  assert.ok(!view.skipped.some((s) => s.name === "senior-review"), "an agent with findings is never shown as skipped, whatever the stored JSON says");
+  assert.ok(view.ran.includes("senior-review"), "an agent with findings appears in the ran list");
+  assert.ok(view.skipped.some((s) => s.name === "visual"), "a genuinely skipped agent stays skipped");
+  const viaEvents = deriveAgentView(report, [], ["perf"]);
+  assert.ok(viaEvents.ran.includes("perf"), "an agent seen in agent events counts as ran");
+  console.log("selftest OK: shared report view — findings/events evidence beats stale stored skip lists");
+}
+
+// Visual baseline identity (WEBTESTER-AUDIT P1-7): role and viewport are part of
+// what a screenshot IS — two roles must not overwrite one baseline.
+{
+  const vp = { width: 1280, height: 800 };
+  assert.notStrictEqual(baselineKey("Admin", "", vp, "/dashboard"), baselineKey("Viewer", "", vp, "/dashboard"), "different roles get different baselines");
+  assert.notStrictEqual(baselineKey("Admin", "", vp, "/dashboard"), baselineKey("Admin", "", { width: 390, height: 844 }, "/dashboard"), "different viewports get different baselines");
+  assert.notStrictEqual(baselineKey("Admin", "mobile", vp, "/x"), baselineKey("Admin", "desktop", vp, "/x"), "different profiles get different baselines");
+  assert.strictEqual(baselineKey("Admin", "", vp, "/dashboard"), baselineKey("Admin", "", vp, "/dashboard"), "the same identity is stable across runs");
+  console.log("selftest OK: visual baselines keyed by role+profile+viewport+route, so roles cannot collide");
+}
+
+// Responsive/layout checks added for the seeded UI bench app (bench/apps/ui.ts).
+{
+  const taps = [
+    { sel: "a#ok", w: 44, h: 44 },
+    { sel: "span.tiny", w: 16, h: 16 },
+    { sel: "button#thin", w: 80, h: 18 },
+    { sel: "i.decorative", w: 2, h: 2 },
+  ];
+  const small = tooSmallTaps(taps).map((t) => t.sel);
+  assert.deepStrictEqual(small, ["span.tiny", "button#thin"], "under-sized targets flagged; a 44px target passes and a 2px decorative element is ignored");
+
+  const a = { x: 0, y: 0, w: 100, h: 100 };
+  assert.strictEqual(overlapRatio(a, { x: 200, y: 200, w: 100, h: 100 }), 0, "disjoint rects do not overlap");
+  assert.strictEqual(overlapRatio(a, { x: 0, y: 0, w: 100, h: 100 }), 1, "identical rects overlap fully");
+  assert.strictEqual(overlapRatio(a, { x: 50, y: 50, w: 100, h: 100 }), 0.25, "a half-offset square covers exactly a quarter — the threshold itself is not a hit");
+  assert.ok(overlapRatio(a, { x: 40, y: 40, w: 100, h: 100 }) > OVERLAP_THRESHOLD, "a 36% collision is over the threshold");
+  assert.ok(overlapRatio(a, { x: 98, y: 0, w: 100, h: 100 }) < OVERLAP_THRESHOLD, "a 2px touching edge is not an overlap");
+  console.log("selftest OK: responsive checks — tap-target sizing and element-overlap ratio");
+}
+
+// Resume safety (WEBTESTER-AUDIT A-3): positional step matching is only sound while
+// each agent name is unique — "login" is registered three times, so an ambiguous name
+// must stop the skipping rather than risk skipping the wrong slot.
+{
+  const ctx = new RunContext("selftest-resume", "p1");
+  ctx.resumeSteps = ["crawler", "a11y", "seo"];
+  assert.strictEqual(ctx.skipCompleted("crawler"), false, "the crawl always re-runs — it lives only in the browser");
+  assert.strictEqual(ctx.skipCompleted("a11y"), true, "a unique, already-completed agent is skipped on resume");
+  assert.strictEqual(ctx.skipCompleted("perf"), false, "a divergent plan stops skipping");
+
+  const dup = new RunContext("selftest-resume-dup", "p1");
+  dup.resumeSteps = ["login", "a11y", "login"];
+  assert.strictEqual(dup.skipCompleted("login"), false, "a repeated agent name must never be skipped positionally (A-3)");
+  assert.strictEqual(dup.skipCompleted("a11y"), false, "after an ambiguous name, skipping stops entirely — re-running is safe, skipping the wrong step is not");
+  console.log("selftest OK: resume skips only unambiguous completed steps, never a repeated agent name");
+}
+
+// Live-view ownership (WEBTESTER-AUDIT P1-4): sticky owner, not "last frame wins".
+{
+  const runId = "selftest-live";
+  const fakeCdp = {} as unknown as Parameters<typeof setLiveSession>[2];
+  assert.ok(claimLiveOwner(runId, "pageA"), "with no owner, any page may claim");
+  setLiveSession(runId, "pageA", fakeCdp, 1280, 800);
+  assert.strictEqual(liveOwnerKey(runId), "pageA", "the first claimant owns the stream");
+  assert.ok(!claimLiveOwner(runId, "pageB"), "a second page cannot steal a live owner mid-stream (no flicker)");
+  assert.ok(claimLiveOwner(runId, "pageA"), "the owner keeps renewing its own claim");
+  assert.ok(claimLiveOwner(runId, "pageB", Date.now() + 10_000), "once the owner goes quiet, handover is allowed");
+  grabControl(runId);
+  assert.ok(!claimLiveOwner(runId, "pageB", Date.now() + 10_000), "a tab a human is driving is never stolen, even if quiet");
+  releaseControl(runId);
+  console.log("selftest OK: live-view ownership is explicit and sticky, and human-held tabs are never stolen");
+}
+
+// Resume (retry of an interrupted run): completed steps replay in lockstep and
+// skipping stops for good at the first divergence; sign-in and crawl always re-run.
+{
+  const ctx = new RunContext("selftest-resume", "selftest");
+  ctx.resumeSteps = ["crawler", "a11y", "perf"];
+  assert.ok(!ctx.skipCompleted("crawler"), "the crawl must re-run — it lives only in the browser");
+  assert.ok(ctx.skipCompleted("a11y"), "a step the interrupted run completed must be skipped");
+  assert.ok(!ctx.skipCompleted("seo"), "a different agent at this position means the plan diverged");
+  assert.ok(!ctx.skipCompleted("perf"), "after a divergence nothing else may be skipped");
+  console.log("selftest OK: resume skips completed steps until the plan diverges");
+}
+
+// Live-view input translation (pure): CDP modifier bitmask, key mapping, and the
+// navigation allow-list that keeps file:/chrome: out of the automation browser.
+assert.strictEqual(modifierMask({}), 0, "no modifiers is an empty mask");
+assert.strictEqual(modifierMask({ ctrl: true }), 2, "ctrl is bit 2");
+assert.strictEqual(modifierMask({ alt: true, ctrl: true, meta: true, shift: true }), 15, "all four modifiers set every bit");
+assert.deepStrictEqual(keyInfo("Enter"), { key: "Enter", code: "Enter", vk: 13 }, "named keys come from the table");
+assert.deepStrictEqual(keyInfo("a"), { key: "a", code: "KeyA", vk: 65 }, "a letter maps to its uppercase virtual key code, so ctrl+a works");
+assert.deepStrictEqual(keyInfo("7"), { key: "7", code: "Digit7", vk: 55 }, "a digit maps to Digit<n>");
+assert.strictEqual(keyInfo("F13"), null, "an unmapped key is rejected, not guessed");
+assert.ok(isNavigable("https://example.com") && isNavigable("back") && isNavigable("reload"), "http(s) urls and history moves are navigable");
+assert.ok(!isNavigable("file:///etc/passwd") && !isNavigable("javascript:alert(1)"), "non-web schemes must never reach Page.navigate");
+console.log("selftest OK: live-view input translation (modifiers, keys, nav allow-list)");
+
+// Who may drive the live browser. This endpoint is remote control of sessions
+// logged in as every role, and the app has no login of its own.
+{
+  const same = { origin: "http://localhost:3000", host: "localhost:3000", token: null };
+  assert.ok(controlAllowed(same, undefined), "the app's own UI may drive the browser");
+  assert.ok(controlAllowed({ ...same, origin: null }, undefined), "a request with no Origin on loopback is same-origin");
+  assert.ok(!controlAllowed({ origin: null, host: "10.0.0.5:3400", token: null }, undefined), "off-box, a missing Origin is not a free pass");
+  assert.ok(controlAllowed({ origin: null, host: "10.0.0.5:3400", token: "s3cret" }, "s3cret"), "off-box without an Origin, the token is what vouches");
+  assert.ok(!controlAllowed({ ...same, origin: "https://evil.example" }, undefined), "another site must never drive the test browser");
+  assert.ok(!controlAllowed({ ...same, origin: "not a url" }, undefined), "an unparseable Origin is rejected, not ignored");
+  assert.ok(!controlAllowed(same, "s3cret"), "a configured token is required once set");
+  assert.ok(controlAllowed({ ...same, token: "s3cret" }, "s3cret"), "the right token passes");
+  assert.ok(!controlAllowed({ ...same, origin: "https://evil.example", token: "s3cret" }, "s3cret"), "a stolen token still can't come from another origin");
+  // DNS rebinding: the attacker's page satisfies Origin===Host (both are its own
+  // hostname) while the request lands here, so agreement alone can't be the test.
+  const rebound = { origin: "http://attacker.example:3400", host: "attacker.example:3400", token: null };
+  assert.ok(!controlAllowed(rebound, undefined), "a rebound host whose Origin matches it is still not us");
+  assert.ok(controlAllowed(rebound, undefined, "attacker.example:3400"), "an explicitly configured host is admitted");
+  assert.ok(controlAllowed({ ...rebound, token: "s3cret" }, "s3cret"), "a configured token vouches for a hosted setup without listing its host");
+  assert.ok(!controlAllowed({ origin: null, host: "attacker.example:3400", token: null }, undefined), "rebinding plus a missing Origin is still rejected");
+  console.log("selftest OK: live-view control guard (host pinning + same-origin + optional token)");
+}
+
+// "Control does nothing" is an inference, not an observation, so it must survive
+// every cheap counter-signal first. A false accusation here teaches readers to
+// distrust the report — the mployedin run flagged a language switcher this way.
+{
+  const quiet = { nodeDelta: 0, textChanged: false, requestsFired: 0, urlChanged: false };
+  assert.ok(clickDidNothing(quiet), "nothing moved at all — the control really does look dead");
+  assert.ok(!clickDidNothing({ ...quiet, textChanged: true }), "a content swap with an identical node count (language toggle, tab, sort) is the control WORKING");
+  assert.ok(!clickDidNothing({ ...quiet, requestsFired: 1 }), "a click that fired a request did something, even if the DOM never re-rendered");
+  assert.ok(!clickDidNothing({ ...quiet, nodeDelta: 5 }), "a re-render is a reaction");
+  assert.ok(!clickDidNothing({ ...quiet, urlChanged: true }), "navigation is a reaction");
+  console.log("selftest OK: a dead-control claim must survive DOM, text, network and navigation counter-signals");
+}
+
+// Root-cause member absorption (P7 completion). The report used to list the
+// symptoms AND the cause that explains them, so one bug was counted many times.
+// The risk of the fix is the opposite failure — absorbing something unrelated
+// HIDES a real bug — so the guards matter more than the collapsing.
+{
+  const mk = (over: Partial<Finding>): Finding => ({
+    id: 0, runId: "r", agent: "route-health", severity: "medium", kind: "bug", source: "deterministic",
+    confidence: 1, title: "t", detail: "d", pageUrl: "https://x/en/jobs", role: null, evidence: null,
+    fingerprint: `fp${Math.round(over.confidence ?? 0)}`, fingerprintV: 1, afterHuman: false, ...over,
+  });
+  const cluster = { kind: "api" as const, signature: "GET /api/jobs/:n", pages: ["https://x/en/jobs", "https://x/en/home"], detail: "" };
+  const symptom = mk({ title: "1 failed request on /en/jobs", detail: "GET /api/jobs/42 → 500" });
+  const otherPage = mk({ title: "1 failed request", detail: "GET /api/jobs/7 → 500", pageUrl: "https://x/en/other" });
+  const unrelatedAgent = mk({ agent: "a11y", title: "Buttons must have discernible text", detail: "on /api/jobs page" });
+  const unrelatedText = mk({ title: "1 console error", detail: "TypeError: undefined is not a function" });
+  const out = absorbRootCauseMembers([symptom, otherPage, unrelatedAgent, unrelatedText], [cluster]);
+  assert.deepStrictEqual(out.membersBySignature.get("GET /api/jobs/:n")?.map((f) => f.title), ["1 failed request on /en/jobs"], "only the matching symptom on a cluster page is absorbed");
+  assert.ok(!out.visible.includes(symptom), "an absorbed symptom stops being counted as its own issue");
+  assert.ok(out.visible.includes(otherPage), "a page outside the cluster keeps its own finding");
+  assert.ok(out.visible.includes(unrelatedAgent), "an a11y finding is never absorbed, even when its text mentions the endpoint");
+  assert.ok(out.visible.includes(unrelatedText), "a symptom whose text doesn't match the signature stays visible");
+  assert.deepStrictEqual(absorbRootCauseMembers([symptom], []).visible, [symptom], "no clusters → nothing is touched");
+  console.log("selftest OK: root-cause clusters absorb their own symptoms and never hide an unrelated finding");
+}
+
+// Run liveness. A second process (dev server, CLI, bench) must never declare a
+// LIVE run dead: runProject polls the status, so a wrong verdict here makes the
+// caller believe the run finished and exit, killing the fleet mid-run.
+{
+  const started = "2026-07-28T10:00:00.000Z";
+  const now = Date.parse("2026-07-28T11:00:00.000Z"); // an hour in — a real full run
+  assert.ok(!isRunAbandoned("2026-07-28T10:59:30.000Z", started, now), "a run beating 30s ago is alive, however long it has been running");
+  assert.ok(isRunAbandoned("2026-07-28T10:50:00.000Z", started, now), "no beat for 10 minutes means the process is gone");
+  assert.ok(isRunAbandoned(null, started, now), "a pre-heartbeat row falls back to its start time");
+  assert.ok(!isRunAbandoned(null, "2026-07-28T10:58:00.000Z", now), "a just-started run without a beat yet is not abandoned");
+  assert.ok(!isRunAbandoned("not a date", started, now), "an unparseable timestamp never destroys a run on a guess");
+  console.log("selftest OK: run liveness is decided by heartbeat, so a long run is never mistaken for an orphan");
+}
 
 // Observation quality (§3.6): the gate that stops the learning layer from
 // trusting unstable execution. Pure classifier first, then the deterministic
@@ -370,6 +655,19 @@ console.log("selftest OK: CRUD data tag is stable within a run and unique across
   console.log("selftest OK: login error scraper prefers the site's own auth error");
 }
 
+// Human-in-the-loop: what a person types into the live-run question box has to
+// map to a login retry — or to "they handled it themselves", which is NOT a retry.
+{
+  assert.deepStrictEqual(parseCredentialAnswer("pass: hunter2", "a@b.com"), { username: "a@b.com", password: "hunter2" }, "labelled password reuses the configured username");
+  assert.deepStrictEqual(parseCredentialAnswer("user: x@y.com / pass: s3cret", "a@b.com"), { username: "x@y.com", password: "s3cret" }, "both labels are honoured");
+  assert.deepStrictEqual(parseCredentialAnswer("x@y.com s3cret", "a@b.com"), { username: "x@y.com", password: "s3cret" }, "unlabelled email+password pair");
+  assert.deepStrictEqual(parseCredentialAnswer("s3cret", "a@b.com"), { username: "a@b.com", password: "s3cret" }, "a bare token is the password");
+  assert.strictEqual(parseCredentialAnswer("continue", "a@b.com"), null, "'continue' means the human signed in themselves, not a retry");
+  assert.strictEqual(parseCredentialAnswer("", "a@b.com"), null, "empty answer is not credentials");
+  assert.strictEqual(parseCredentialAnswer("user: x@y.com", "a@b.com"), null, "a username with no password can't be attempted");
+  console.log("selftest OK: human credential answers parse into a retry or a hands-off continue");
+}
+
 // Run report (Plan-v3 Fix C): failed sessions quote the login finding, the
 // anonymous fallback still counts as coverage, and skipped agents carry a reason.
 {
@@ -432,6 +730,91 @@ console.log("selftest OK: CRUD data tag is stable within a run and unique across
   assert.strictEqual(totals.journeysDefined, 2, "journey counters pass through");
   assert.strictEqual(totals.journeysPassed, 1, "journeys passed pass through");
   console.log("selftest OK: coverage totals report honest discovered-vs-tested ratios");
+}
+
+// PLAN-REPORT-TRUST §1: lock the coverage-denominator invariant directly, so it
+// can never regress even if the union in computeCoverageTotals is ever touched.
+// The exact bug: a page adopted mid-run by the interaction agent (a click that
+// reveals a route the crawler never linked) lands in testedUrls but not pages.
+{
+  const pages = [{ url: "https://x.com/a" }, { url: "https://x.com/b" }]; // crawler-discovered
+  const adopted = "https://x.com/adopted-by-click"; // never in `pages`, only in testedUrls
+  const tested = new Set(["https://x.com/a", adopted]);
+  const totals = computeCoverageTotals(pages, tested, { controlsSeen: 0, controlsClicked: 0, journeysDefined: 0, journeysPassed: 0 });
+  assert.ok(totals.pagesTested <= totals.pagesDiscovered, `pagesTested (${totals.pagesTested}) must never exceed pagesDiscovered (${totals.pagesDiscovered})`);
+  assert.ok(totals.templatesTested <= totals.templatesDiscovered, `templatesTested (${totals.templatesTested}) must never exceed templatesDiscovered (${totals.templatesDiscovered})`);
+  assert.strictEqual(totals.pagesDiscovered, 3, "the adopted route counts toward discovered, closing the 115-of-114 bug");
+  console.log("selftest OK: pagesTested/templatesTested can never exceed their discovered denominator, even with an adopted route");
+}
+
+// PLAN-REPORT-TRUST §2: the rendered report can never show an agent as both
+// having run (findings/activity) and "did not run" — the renderer derives the
+// skip list from agentsRan at render time instead of trusting a stored list
+// that may have been computed before a late agent (senior-review) finished.
+{
+  const run: Run = {
+    id: "r1", projectId: "p1", mode: "smart", status: "passed", startedAt: "2026-07-28T10:00:00.000Z",
+    finishedAt: "2026-07-28T10:05:00.000Z", summary: null, aiTokens: 7769,
+    reportJson: JSON.stringify({
+      sessions: [{ role: "Admin", ok: true, detail: "1 page(s) tested" }],
+      coverage: [{ role: "Admin", pagesTested: 1, findings: 1 }],
+      agentsRan: ["login", "senior-review"],
+      // Stale skip entry: senior-review ran late, but the list built before it finished still names it.
+      agentsSkipped: [{ name: "senior-review", reason: "AI layer did not run" }],
+    } satisfies RunReport),
+    missionAgents: ["login", "senior-review"], commitSha: null, humanTakeoverAt: null,
+  };
+  const finding: Finding = {
+    id: 1, runId: "r1", agent: "senior-review", severity: "info", kind: "improvement", source: "ai", confidence: 1,
+    title: "Fix checkout first", detail: "business-impact note", pageUrl: null, role: "Admin",
+    evidence: null, fingerprint: "fp1", fingerprintV: 1, afterHuman: false,
+  };
+  const md = buildReportMarkdown(run, "Acme", "https://acme.test", [finding], []);
+  assert.ok(!md.includes("did not run"), "an agent present in agentsRan must never be rendered as skipped, however stale the stored skip list is");
+
+  // The case that actually shipped broken: stored agentsRan does NOT list the agent
+  // (the report was serialized before senior-review finished), but its finding is
+  // right there in the table. Findings are the stronger evidence — an agent that
+  // produced one demonstrably ran. Rendering a real run caught this; the assertion
+  // above did not, because it put the agent in agentsRan where the filter saw it.
+  const staleRun: Run = { ...run, reportJson: JSON.stringify({
+    sessions: [{ role: "Admin", ok: true, detail: "1 page(s) tested" }],
+    coverage: [{ role: "Admin", pagesTested: 1, findings: 1 }],
+    agentsRan: ["login"],
+    agentsSkipped: [{ name: "senior-review", reason: "AI layer did not run" }],
+  } satisfies RunReport) };
+  const staleMd = buildReportMarkdown(staleRun, "Acme", "https://acme.test", [finding], []);
+  assert.ok(!staleMd.includes("did not run"), "an agent that produced a finding is never reported as 'did not run', whatever the stored lists say");
+
+  // And an agent that genuinely produced nothing still gets its honest skip line —
+  // the fix must not silently swallow the whole section.
+  const reallySkipped: Run = { ...staleRun, reportJson: JSON.stringify({
+    sessions: [], coverage: [], agentsRan: ["login"],
+    agentsSkipped: [{ name: "crud", reason: "full mode only" }],
+  } satisfies RunReport) };
+  assert.ok(buildReportMarkdown(reallySkipped, "Acme", "https://acme.test", [], []).includes("crud (full mode only)"), "a genuinely skipped agent keeps its reason in the report");
+  console.log("selftest OK: an agent with findings is never rendered as 'did not run', and real skips keep their reason");
+}
+
+// Coverage denominators are derived at render time, not trusted (PLAN-REPORT-TRUST
+// §1). The producer now unions discovered ∪ tested, but a report_json stored before
+// that fix still holds an impossible ratio — and "115 of 114 pages tested" makes a
+// reader doubt every other number on the page.
+{
+  const run: Run = {
+    id: "r2", projectId: "p1", mode: "smart", status: "passed", startedAt: "2026-07-28T10:00:00.000Z",
+    finishedAt: "2026-07-28T10:05:00.000Z", summary: null, aiTokens: 0,
+    reportJson: JSON.stringify({
+      sessions: [], coverage: [], agentsRan: [], agentsSkipped: [],
+      coverageTotals: { pagesDiscovered: 114, pagesTested: 115, templatesDiscovered: 98, templatesTested: 99, controlsSeen: 1498, controlsClicked: 324, journeysDefined: 0, journeysPassed: 0 },
+    } satisfies RunReport),
+    missionAgents: [], commitSha: null, humanTakeoverAt: null,
+  };
+  const md = buildReportMarkdown(run, "Acme", "https://acme.test", [], []);
+  assert.ok(md.includes("115 of 115 discovered pages tested"), "a stale impossible ratio renders as 100%, never as more-tested-than-discovered");
+  assert.ok(md.includes("(99/99 unique page types)"), "the template denominator is derived the same way");
+  assert.ok(!md.includes("of 114"), "the impossible stored denominator never reaches the page");
+  console.log("selftest OK: coverage denominators can never render above 100%, even from a pre-fix stored report");
 }
 
 // Coverage matrix (Plan-v6 V4): sibling URLs collapse to one template row; a
@@ -693,6 +1076,17 @@ console.log("selftest OK: CRUD data tag is stable within a run and unique across
   const wrongAgent = scoreBench([defects[0]], [f("seo", "alt text mentioned here", "http://x/items")]);
   assert.strictEqual(wrongAgent.detected.length, 0, "a keyword hit from the wrong dimension's agent does not count");
   console.log("selftest OK: bench scorer credits the right agent+page+keyword and reports unseeded/duplicate rates");
+
+  // Plan-v8 §3.3 human-FP feed: reviewer-suppressed fingerprints count as
+  // confirmed noise — additive, so every pre-v8 metric above stays untouched.
+  const fpFindings = findings.map((x, i) => ({ ...x, fingerprint: `fp-${i}` }));
+  const withFp = scoreBench(defects, fpFindings, new Set(["fp-2", "fp-999"]));
+  assert.strictEqual(withFp.humanFalsePositives, 1, "only fingerprints present in this run's findings are counted");
+  assert.strictEqual(withFp.humanFpRate, 1 / 4, "human-FP rate is over all findings");
+  assert.deepStrictEqual([withFp.detected.length, withFp.unseededFindings], [s.detected.length, s.unseededFindings], "existing metrics are unchanged by the feedback feed");
+  const noFp = scoreBench(defects, fpFindings);
+  assert.deepStrictEqual([noFp.humanFalsePositives, noFp.humanFpRate], [0, 0], "no suppressed set → metric is zero, never undefined");
+  console.log("selftest OK: bench scorer counts reviewer-marked false positives without disturbing baseline metrics");
 }
 
 // Semantic snapshot (Plan-v7 §3.1): the pure a11y+DOM derivation the browser
@@ -836,7 +1230,12 @@ console.log("selftest OK: CRUD data tag is stable within a run and unique across
   assert.strictEqual(relationshipOf(true, "t1", "t2"), "owner", "owner beats tenancy");
   assert.strictEqual(relationshipOf(false, "t1", "t1"), "same-tenant", "matching tenants when not owner");
   assert.strictEqual(relationshipOf(false, "t1", "t2"), "other-tenant", "different tenants");
-  assert.strictEqual(relationshipOf(false, null, null), "other-tenant", "unknown tenancy defaults to other-tenant (safe)");
+  // WEBTESTER-AUDIT P1-13: unlearned tenancy is NOT evidence of separate tenancy —
+  // two roles sharing a tenant were previously reported as a critical cross-tenant leak.
+  assert.strictEqual(relationshipOf(false, null, null), "unknown", "unknown tenancy is 'unknown', never assumed other-tenant");
+  assert.strictEqual(relationshipOf(false, "t1", null), "unknown", "a missing resource tenant is still unknown");
+  assert.strictEqual(classifyRelAuthz("unknown", 200), "inconclusive", "a 2xx with unknown tenancy is inconclusive, not vulnerable (P1-13)");
+  assert.strictEqual(classifyRelAuthz("unknown", 404), "protected", "404 hides the resource whatever the tenancy");
   assert.strictEqual(classifyRelAuthz("other-tenant", 200), "vulnerable", "cross-tenant 2xx is a leak");
   assert.strictEqual(classifyRelAuthz("owner", 200), "protected", "the owner succeeding is correct");
   assert.strictEqual(classifyRelAuthz("same-tenant", 200), "inconclusive", "intra-org access may be legitimate sharing");
@@ -983,6 +1382,227 @@ console.log("selftest OK: CRUD data tag is stable within a run and unique across
   console.log("selftest OK: §3.3 cross-run lifecycle judges against prior history and never persists a flagged transition");
 }
 
+// Cross-run experience (Plan-v8 §1/§2): merge/contradiction/promotion/recall are pure,
+// selftested without a database — db.ts is a thin, untested CRUD layer (same split as
+// lifecycle.ts/contracts.ts above).
+{
+  const row = (over: Partial<ExperienceRow> = {}): ExperienceRow => ({
+    id: 1, origin: "https://a.com", scope: "site", kind: "fact", subject: "s", predicate: "p", object: "o",
+    confidence: 0.8, source: "observed", evidence: "[]", runCount: 3, successCount: 3, lastRunId: "r1", updatedAt: 1000, contradictedAt: null,
+    ...over,
+  });
+  const input = (over: Partial<ExperienceInput> = {}): ExperienceInput => ({
+    origin: "https://a.com", scope: "site", kind: "fact", subject: "s", predicate: "p", object: "o",
+    confidence: 0.5, source: "observed", evidence: ["e1"], runId: "r2", ...over,
+  });
+
+  const created = mergeExperience(null, input(), 2000);
+  assert.strictEqual(created.runCount, 1, "a brand-new row starts at run_count 1");
+  assert.strictEqual(created.confidence, 0.5, "a brand-new row takes the asserted confidence");
+
+  const merged = mergeExperience(row(), input({ confidence: 0.4 }), 2000);
+  assert.strictEqual(merged.runCount, 4, "run_count always increments on conflict");
+  assert.strictEqual(merged.confidence, 0.8, "confidence takes the max, not the newest");
+
+  const recWorked = mergeExperience(row({ kind: "recovery", runCount: 5, successCount: 5, confidence: 0.9 }), input({ kind: "recovery", workedThisRun: true }), 2000);
+  assert.strictEqual(recWorked.successCount, 6, "a working recovery increments success_count");
+  assert.strictEqual(recWorked.confidence, 0.9, "a working recovery does not touch confidence");
+
+  const trusted = row({ kind: "recovery", runCount: 10, successCount: 8, confidence: 0.9 });
+  const failed = mergeExperience(trusted, input({ kind: "recovery", workedThisRun: false }), 5000);
+  assert.strictEqual(failed.confidence, 0.45, "a trusted (≥70%) recovery failing halves confidence — the poison-guard contradiction");
+  assert.strictEqual(failed.contradictedAt, 5000, "the contradiction is stamped");
+
+  const shaky = row({ kind: "recovery", runCount: 10, successCount: 3, confidence: 0.7 });
+  const stillFailing = mergeExperience(shaky, input({ kind: "recovery", workedThisRun: false }), 5000);
+  assert.strictEqual(stillFailing.confidence, 0.7, "an already-unreliable recovery failing again is not a new contradiction");
+  assert.strictEqual(stillFailing.contradictedAt, null, "no contradiction stamped below the trust floor");
+
+  console.log("selftest OK: §1.2 experience upsert increments run_count, takes max confidence, and poison-guards a contradicted recovery");
+}
+
+{
+  const conflicting: ExperienceRow[] = [
+    { id: 1, origin: "https://a.com", scope: "site", kind: "fact", subject: "s", predicate: "p", object: "old", confidence: 0.8, source: "observed", evidence: "[]", runCount: 2, successCount: 2, lastRunId: "r1", updatedAt: 1, contradictedAt: null },
+  ];
+  const [c] = contradictRows(conflicting, 9000);
+  assert.strictEqual(c.confidence, 0.4, "a contradicted fact row's confidence is halved");
+  assert.strictEqual(c.contradictedAt, 9000, "contradicted_at is stamped on the old, now-wrong row");
+  console.log("selftest OK: §1.2 contradictRows halves confidence and stamps contradicted_at on conflicting rows");
+}
+
+{
+  assert.strictEqual(generalizeSubject("#user-42"), "#id", "a hash id generalizes");
+  assert.strictEqual(generalizeSubject('[data-testid="row-7"]'), "[data-testid]", "a data-testid selector generalizes");
+  assert.strictEqual(generalizeSubject("order/123e4567-e89b-12d3-a456-426614174000"), "order/:uuid", "a uuid generalizes");
+  assert.strictEqual(generalizeSubject("row-58"), "row-:n", "bare digit runs generalize");
+  console.log("selftest OK: §2 generalizeSubject strips origin-specific identifiers to a site-agnostic signature");
+}
+
+{
+  const mkRow = (origin: string, runCount: number, successCount: number): ExperienceRow => ({
+    id: 1, origin, scope: "site", kind: "recovery", subject: "#login-button-42", predicate: "recovery", object: "waitUntilEnabled",
+    confidence: 0.8, source: "observed", evidence: "[]", runCount, successCount, lastRunId: "r", updatedAt: 1, contradictedAt: null,
+  });
+  const threeOrigins = [mkRow("https://a.com", 5, 5), mkRow("https://b.com", 5, 4), mkRow("https://c.com", 5, 4)];
+  const promoted = computeGlobalPromotions(threeOrigins, 9999);
+  assert.strictEqual(promoted.length, 1, "a recovery seen across ≥3 origins at ≥70% success promotes to a global row");
+  assert.strictEqual(promoted[0].scope, "global", "the promoted row is global-scoped");
+  assert.strictEqual(promoted[0].origin, "", "a global row carries no origin");
+  assert.strictEqual(promoted[0].subject, "#id", "the promoted subject is generalized, not any one origin's literal selector");
+
+  const twoOrigins = [mkRow("https://a.com", 5, 5), mkRow("https://b.com", 5, 5)];
+  assert.strictEqual(computeGlobalPromotions(twoOrigins, 9999).length, 0, "fewer than 3 distinct origins does not promote");
+
+  const lowRate = [mkRow("https://a.com", 5, 1), mkRow("https://b.com", 5, 1), mkRow("https://c.com", 5, 1)];
+  assert.strictEqual(computeGlobalPromotions(lowRate, 9999).length, 0, "below the success-rate threshold does not promote");
+  console.log("selftest OK: §2 computeGlobalPromotions promotes a recovery pattern only across ≥3 origins at ≥70% success");
+}
+
+{
+  const facts = new FactStore();
+  const rows: ExperienceRow[] = [
+    { id: 1, origin: "https://a.com", scope: "site", kind: "fact", subject: "candidate", predicate: "state", object: "hired", confidence: 0.9, source: "observed", evidence: "[]", runCount: 3, successCount: 3, lastRunId: "r", updatedAt: 1, contradictedAt: null },
+    { id: 2, origin: "https://a.com", scope: "site", kind: "fact", subject: "candidate", predicate: "state", object: "stale", confidence: 0.3, source: "observed", evidence: "[]", runCount: 1, successCount: 1, lastRunId: "r", updatedAt: 1, contradictedAt: 5 },
+    { id: 3, origin: "https://a.com", scope: "site", kind: "recovery", subject: "x", predicate: "recovery", object: "y", confidence: 0.9, source: "observed", evidence: "[]", runCount: 3, successCount: 3, lastRunId: "r", updatedAt: 1, contradictedAt: null },
+  ];
+  const seeded = recallFacts(facts, rows);
+  assert.strictEqual(seeded, 1, "only the fact row above the confidence floor is seeded — recovery rows and contradicted facts are not facts");
+  assert.ok(facts.knows("candidate", "state"), "the seeded fact is queryable — this is what lets §3.5 skip re-probing it");
+  assert.ok(summarizeForPrompt(rows)!.includes("candidate"), "the prompt summary mentions a notable recalled row");
+  console.log("selftest OK: §1.3 recallFacts seeds only trustworthy fact rows, gating §3.5 re-probing");
+}
+
+{
+  const rows: ExperienceRow[] = [
+    { id: 1, origin: "a", scope: "site", kind: "recovery", subject: "login:role1", predicate: "recovery", object: "lowercase-email", confidence: 0.7, source: "observed", evidence: "[]", runCount: 9, successCount: 8, lastRunId: "r", updatedAt: 1, contradictedAt: null },
+    { id: 2, origin: "a", scope: "site", kind: "recovery", subject: "login:role1", predicate: "recovery", object: "flaky-strategy", confidence: 0.7, source: "observed", evidence: "[]", runCount: 9, successCount: 2, lastRunId: "r", updatedAt: 1, contradictedAt: null },
+  ];
+  const best = recallRecoveryStrategy(rows, "login:role1");
+  assert.ok(best && best.strategy === "lowercase-email", "recall picks the strategy with the highest success rate above the trust floor");
+  assert.strictEqual(recallRecoveryStrategy(rows, "login:unknown-role"), null, "no match for a subject with no recorded recovery");
+  console.log("selftest OK: §1.3 recallRecoveryStrategy recalls the reliable strategy for a known failure signature");
+}
+
+// Human feedback loop (Plan-v8 §3): normalization and suppression are pure, selftested
+// without a database.
+{
+  const same = (a: [string, string, string | null], b: [string, string, string | null]): boolean => {
+    const na = normalizeForFingerprint(...a);
+    const nb = normalizeForFingerprint(...b);
+    return na.agent === nb.agent && na.title === nb.title && na.pageUrl === nb.pageUrl;
+  };
+  assert.ok(same(["security", "Order #4521 failed to load", "https://x.com/orders/4521"], ["security", "Order #9981 failed to load", "https://x.com/orders/9981"]),
+    "a dynamic id in both title and URL normalizes to the same identity");
+  assert.ok(same(["a11y", "Missing alt text", "https://x.com/checkout?ref=abc"], ["a11y", "Missing alt text", "https://x.com/checkout#top"]),
+    "query string and hash fragment are dropped");
+  assert.ok(same(["security", "Weak cookie on user/00000000-0000-4000-8000-000000000000", "https://x.com/a"], ["security", "Weak cookie on user/11111111-1111-4111-8111-111111111111", "https://x.com/a"]),
+    "a uuid embedded in the title normalizes the same");
+  assert.ok(!same(["security", "x", "https://x.com/users/42"], ["security", "x", "https://x.com/orders/42"]),
+    "different literal path segments are NOT the same finding");
+  assert.ok(!same(["security", "x", "https://x.com/a"], ["a11y", "x", "https://x.com/a"]),
+    "different agents are NOT the same finding");
+  console.log("selftest OK: §3.2 normalizeForFingerprint collapses dynamic ids/counts to a stable identity without merging distinct findings");
+}
+
+{
+  const findings = [{ fingerprint: "fp1", title: "A" }, { fingerprint: "fp2", title: "B" }, { fingerprint: "fp3", title: "C" }];
+  const feedback = new Map<string, FeedbackEntry>([
+    ["fp1", { verdict: "false_positive", reason: "shadow DOM" }],
+    ["fp2", { verdict: "confirmed", reason: "" }],
+  ]);
+  const { visible, suppressed, confirmed } = partitionByFeedback(findings, feedback);
+  assert.strictEqual(visible.length, 2, "false-positive is removed from visible, confirmed and unmarked stay");
+  assert.ok(!visible.some((f) => f.fingerprint === "fp1"), "the false-positive finding is not in the visible set");
+  assert.strictEqual(suppressed.length, 1, "exactly one suppressed entry");
+  assert.strictEqual(suppressed[0].reason, "shadow DOM", "the stored reason is carried through, never dropped");
+  assert.ok(confirmed.has("fp2"), "a confirmed finding is tagged, not suppressed");
+  console.log("selftest OK: §3.3 partitionByFeedback suppresses false-positive/intended, tags confirmed, never deletes");
+}
+
+// OWASP Top 10 mapping (Plan-v8 §6): CWE map, coverage matrix, npm audit parsing, and
+// the A07 lockout-probe safety guard are all pure, selftested without a database/network.
+{
+  for (const [cwe, cats] of Object.entries(CWE_TO_OWASP)) {
+    for (const c of cats) assert.ok(OWASP_CATEGORIES.includes(c), `CWE ${cwe} maps to a real OWASP category (${c})`);
+  }
+  assert.deepStrictEqual(owaspForCwe(79), ["A03:2021"], "a mapped CWE (XSS) resolves to its category");
+  assert.strictEqual(owaspForCwe(999999), undefined, "an unmapped CWE gets no tag — never a guess");
+  assert.strictEqual(owaspForCwe(null), undefined, "no CWE id at all gets no tag");
+  console.log("selftest OK: §6.3 CWE→OWASP map is total over its own key set and never guesses on an unmapped CWE");
+}
+
+{
+  const tested = new Map<string, Set<string>>([
+    ["https://x.com/a", new Set(["permissions", "crawler"])],
+    ["https://x.com/b", new Set(["security"])],
+  ]);
+  const findings = [{ owasp: ["A01:2021"] }, { owasp: ["A01:2021", "A05:2021"] }, { owasp: undefined }];
+  const rows = buildOwaspCoverage(tested, findings, { "A06:2021": 1, "A07:2021": 3 });
+  assert.strictEqual(rows.length, 10, "all ten categories are always listed, never omitted");
+  const a01 = rows.find((r) => r.category === "A01:2021")!;
+  assert.strictEqual(a01.tested, 1, "A01 'tested' comes from the existing url×agent map — one url touched by permissions");
+  assert.strictEqual(a01.findings, 2, "A01 findings count sums findings tagged with that category");
+  const a04 = rows.find((r) => r.category === "A04:2021")!;
+  assert.strictEqual(a04.tested, null, "A04 is honestly not tested — never a fake zero");
+  assert.ok(a04.notTestedReason, "a not-tested category carries its reason");
+  const a06 = rows.find((r) => r.category === "A06:2021")!;
+  assert.strictEqual(a06.tested, 1, "A06's one-off tested count (npm audit ran) is passed through, not derived from the url map");
+  console.log("selftest OK: §6.4 buildOwaspCoverage lists all ten categories, sources counts from the existing tested map, never invents partial coverage");
+}
+
+{
+  const fixture = { vulnerabilities: { lodash: { severity: "high", fixAvailable: true }, minimist: { severity: "moderate", fixAvailable: false } } };
+  const vulns = parseNpmAudit(fixture);
+  assert.strictEqual(vulns.length, 2, "npm audit fixture parses both vulnerable packages");
+  assert.ok(vulns.find((v) => v.name === "lodash" && v.severity === "high" && v.fixAvailable), "severity and fixAvailable are read through");
+  assert.strictEqual(parseNpmAudit({}).length, 0, "a report with no vulnerabilities key parses to an empty list, not a crash");
+  console.log("selftest OK: §6.5 parseNpmAudit reads a fixture JSON report with no network call");
+}
+
+{
+  const roles = [{ username: "admin@example.com" }, { username: "user@example.com" }];
+  assert.ok(isSafeProbeUsername("qabot-nonexistent-123@example.invalid", roles), "a fabricated username not matching any configured role is safe to probe");
+  assert.ok(!isSafeProbeUsername("admin@example.com", roles), "a username matching a configured role is NEVER safe — the lockout probe must refuse it");
+  assert.ok(!isSafeProbeUsername("Admin@Example.com", roles), "the check is case-insensitive — a differently-cased real account is still a real account");
+  console.log("selftest OK: §6.5 A07 lockout probe's username guard refuses any username matching a configured role's credentials");
+}
+
+// Multi-model verification + routing (Plan-v8 §4): routing is pure, selftested
+// without a network call.
+{
+  assert.deepStrictEqual(parseAiRoute('{"vision":"google/gemini-2.0-flash","classify":"qwen/qwen-2.5-7b"}'),
+    { vision: "google/gemini-2.0-flash", classify: "qwen/qwen-2.5-7b" }, "AI_ROUTE JSON parses purpose->model");
+  assert.deepStrictEqual(parseAiRoute("not json"), {}, "malformed AI_ROUTE never throws, just yields no routes");
+  assert.deepStrictEqual(parseAiRoute(undefined), {}, "unset AI_ROUTE yields no routes");
+  assert.strictEqual(resolveRoutedModel("verify", "openai/gpt-4o-mini", {}), "openai/gpt-4o-mini", "the verify purpose routes to AI_VERIFY_MODEL");
+  assert.strictEqual(resolveRoutedModel("verify", undefined, {}), null, "verify purpose with no AI_VERIFY_MODEL does not route");
+  assert.strictEqual(resolveRoutedModel("vision", undefined, { vision: "google/gemini-2.0-flash" }), "google/gemini-2.0-flash", "a non-verify purpose routes via AI_ROUTE");
+  assert.strictEqual(resolveRoutedModel(undefined, "x", { plan: "y" }), null, "no purpose at all never routes — today's default behavior is untouched");
+  console.log("selftest OK: §4.1 AI_ROUTE parsing and purpose→model resolution never silently falls back to the primary provider");
+}
+
+{
+  assert.deepStrictEqual(classifyVerifyResult({ verdict: "refuted", reason: "no evidence of X" }), { verdict: "refuted", reason: "no evidence of X" }, "a valid verdict parses through");
+  assert.strictEqual(classifyVerifyResult({ verdict: "maybe" }), null, "an invalid verdict value is rejected, not coerced");
+  assert.strictEqual(classifyVerifyResult(null), null, "no response at all is rejected");
+  console.log("selftest OK: §4.2 classifyVerifyResult narrows untrusted tool output to a real verdict or null");
+}
+
+// MCP server target-origin guard (Plan-v8 §5.1): pure, selftested. Defaults to
+// loopback-only since an MCP server is a standing process any connected client
+// can call `run_test` on — unlike the CLI, which is unguarded by design (whoever
+// runs it already has that access).
+{
+  assert.ok(targetOriginAllowed("http://localhost:3400/anything", undefined), "loopback is always allowed with no allowlist configured");
+  assert.ok(targetOriginAllowed("http://127.0.0.1:3400", undefined), "127.0.0.1 counts as loopback too");
+  assert.ok(!targetOriginAllowed("https://example.com", undefined), "a non-loopback origin is refused with no allowlist configured — the safe default");
+  assert.ok(targetOriginAllowed("https://staging.example.com/foo", "https://staging.example.com,http://localhost:3000"), "an origin in MCP_ALLOWED_ORIGINS is allowed regardless of path");
+  assert.ok(!targetOriginAllowed("https://evil.example.com", "https://staging.example.com"), "an origin NOT in MCP_ALLOWED_ORIGINS is refused even when the env var is set");
+  assert.ok(!targetOriginAllowed("not a url", undefined), "an unparseable url is refused, not thrown");
+  console.log("selftest OK: §5.1 targetOriginAllowed defaults to loopback-only and MCP_ALLOWED_ORIGINS is an exact-origin allowlist");
+}
+
 // §3.5 probe-executor loop, end-to-end through a fake browser IO. Kept in a guarded async
 // IIFE at the file's end because the selftest runner is cjs (no top-level await); a thrown
 // assertion becomes an explicit non-zero exit so a regression still fails the run.
@@ -1011,3 +1631,82 @@ void (async (): Promise<void> => {
     process.exit(1);
   }
 })();
+
+// §4.2 crossModelVerify, end-to-end through a mocked global.fetch — kept guarded and
+// async for the same cjs-no-top-level-await reason as the block above.
+void (async (): Promise<void> => {
+  const originalFetch = global.fetch;
+  const savedVerifyModel = process.env.AI_VERIFY_MODEL;
+  const savedOpenRouterKey = process.env.OPENROUTER_API_KEY;
+  try {
+    const mkFinding = (over: Partial<Finding> = {}): Finding => ({
+      id: 1, runId: "r", agent: "ai-reviewer", severity: "high", kind: "bug", source: "ai", confidence: 0.7,
+      title: "X", detail: "evidence", pageUrl: null, role: null, evidence: null, fingerprint: "fp1", fingerprintV: 2, afterHuman: false, owasp: [],
+      ...over,
+    });
+
+    delete process.env.AI_VERIFY_MODEL;
+    let fetchCalls = 0;
+    global.fetch = (() => { fetchCalls++; throw new Error("should not be called without AI_VERIFY_MODEL"); }) as typeof fetch;
+    const noEnvResult = await crossModelVerify([mkFinding()], new Set());
+    assert.deepStrictEqual(noEnvResult, [], "no AI_VERIFY_MODEL → no verdicts");
+    assert.strictEqual(fetchCalls, 0, "no AI_VERIFY_MODEL → zero fetch calls, never a silent fallback to the primary provider");
+
+    process.env.AI_VERIFY_MODEL = "openai/gpt-4o-mini";
+    process.env.OPENROUTER_API_KEY = "test-key";
+    global.fetch = (async () => ({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { tool_calls: [{ function: { arguments: JSON.stringify({ verdict: "refuted", reason: "not reproducible from the evidence given" }) } }] } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
+      }),
+      text: async () => "",
+    })) as unknown as typeof fetch;
+    const verified = await crossModelVerify([mkFinding()], new Set());
+    assert.strictEqual(verified.length, 1, "a mocked refute call produces one verdict");
+    assert.strictEqual(verified[0].verdict, "refuted", "the verdict is read through — report-doc.ts demotes this to the Unverified section");
+
+    const skipped = await crossModelVerify([mkFinding()], new Set(["fp1"]));
+    assert.deepStrictEqual(skipped, [], "a finding already confirmed by a human (Phase 3) is never sent for a second opinion");
+
+    console.log("selftest OK: §4.2 crossModelVerify makes zero calls without AI_VERIFY_MODEL, demotes a mocked refuted verdict, and skips human-confirmed findings");
+  } catch (e) {
+    console.error("selftest FAIL: §4.2 crossModelVerify", e);
+    process.exit(1);
+  } finally {
+    global.fetch = originalFetch;
+    if (savedVerifyModel === undefined) delete process.env.AI_VERIFY_MODEL; else process.env.AI_VERIFY_MODEL = savedVerifyModel;
+    if (savedOpenRouterKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = savedOpenRouterKey;
+  }
+})();
+
+// Page-judge multi-viewport shots: full mode gets extra below-the-fold shots on
+// tall pages so the AI eye sees more than the top viewport; smart/quick stay at
+// one shot (breadth over depth), and a zero-height viewport never divides by 0.
+{
+  assert.deepStrictEqual(judgeShotFractions(800, 800, "full"), [0], "short page: one shot even in full mode");
+  assert.deepStrictEqual(judgeShotFractions(2000, 800, "full"), [0, 1], "2-5 viewports tall: top + bottom");
+  assert.deepStrictEqual(judgeShotFractions(8000, 800, "full"), [0, 0.5, 1], ">=5 viewports tall: top + middle + bottom");
+  assert.deepStrictEqual(judgeShotFractions(8000, 800, "smart"), [0], "smart mode always one shot — keeps page breadth within the AI budget");
+  assert.deepStrictEqual(judgeShotFractions(8000, 0, "full"), [0], "zero viewport height falls back to one shot, no division by zero");
+  console.log("selftest OK: judgeShotFractions scales AI-judge shots by page height and run mode");
+}
+
+// Page-judge target picking: one page per inferred type first, then top up from
+// the ranked crawl. Regression guard — a real run against a dashboard-style SaaS
+// inferred a single page type for every page, so the AI judge looked at exactly
+// 1 page of 205 and left ~95% of its token slice unspent.
+{
+  const types = new Map([["/a", "list"], ["/b", "list"], ["/c", "list"]]);
+  const ranked = ["/a", "/b", "/c", "/d", "/e"];
+  const collapsed = pickJudgeTargets(types, ranked, 4);
+  assert.strictEqual(collapsed.length, 4, "one collapsed page type still fills every judge slot from the ranked crawl");
+  assert.deepStrictEqual(collapsed.map((t) => t[1]), ["/a", "/b", "/c", "/d"], "type representative first, then ranked order, no repeats");
+  assert.strictEqual(collapsed[3][0], "unknown", "a topped-up page with no inferred type is labelled unknown, not mislabelled");
+
+  const varied = pickJudgeTargets(new Map([["/x", "list"], ["/y", "detail"], ["/z", "form"]]), ["/x", "/y", "/z", "/w"], 3);
+  assert.deepStrictEqual(varied.map((t) => t[0]), ["list", "detail", "form"], "distinct types win the slots over topping up");
+  assert.deepStrictEqual(pickJudgeTargets(new Map(), ["/only"], 4), [["unknown", "/only"]], "no page types at all still judges the crawled pages");
+  assert.deepStrictEqual(pickJudgeTargets(new Map(), [], 4), [], "nothing crawled means nothing to judge");
+  console.log("selftest OK: pickJudgeTargets spreads across page types then tops up so the AI judge budget is not left unspent");
+}

@@ -71,7 +71,7 @@ export async function seoAgent(ctx: RunContext, browserCtx: BrowserContext, proj
   for (const target of sample) {
     const page = await browserCtx.newPage();
     try {
-      await page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, target.url, AGENT);
       const signals = await page.evaluate((): SeoSignals => {
         const attr = (sel: string, a: string) => (document.querySelector(sel)?.getAttribute(a) || "").trim();
         const robots = attr('meta[name="robots" i]', "content").toLowerCase();

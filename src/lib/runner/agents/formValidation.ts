@@ -19,7 +19,7 @@ export async function formValidationAgent(ctx: RunContext, browserCtx: BrowserCo
     const page = await browserCtx.newPage();
     try {
       ctx.status(AGENT, `Testing form on ${url} as ${role.name}`, { url });
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, url, AGENT);
       const audit = await page.evaluate(() => {
         const inputs = Array.from(document.querySelectorAll("input, select, textarea")) as HTMLInputElement[];
         let unlabeledRequired = 0;
@@ -73,13 +73,13 @@ export async function formValidationAgent(ctx: RunContext, browserCtx: BrowserCo
             ctx.finding({ agent: AGENT, severity: "high", role: role.name, pageUrl: url,
               title: "Empty required form submit returns a server error",
               detail: "Submitting the form with every required field empty produced a 5xx response — the app should reject empty input with client-side validation before it reaches the server.",
-              evidence: await ctx.screenshot(page, "empty-submit-500", { role: role.name }) });
+              evidence: await ctx.screenshot(page, "empty-submit-500", { role: role.name }), owasp: ["A03:2021"] });
           } else if (navigated) {
             // ponytail: navigation heuristic — a server-rendered "fix errors" page also navigates, hence confidence 0.6.
             ctx.finding({ agent: AGENT, severity: "medium", confidence: 0.6, role: role.name, pageUrl: url,
               title: "Empty required form appears to submit without validation",
               detail: "Submitting with required fields empty navigated away instead of showing a validation error — the form may accept empty input or fail silently. Verify the target page.",
-              evidence: await ctx.screenshot(page, "empty-submit-silent", { role: role.name }) });
+              evidence: await ctx.screenshot(page, "empty-submit-silent", { role: role.name }), owasp: ["A03:2021"] });
           } else {
             ctx.log(AGENT, "pass", `Empty-submit validation held on ${url}`);
           }

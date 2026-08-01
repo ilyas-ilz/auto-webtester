@@ -1,8 +1,11 @@
 import fs from "fs";
 import path from "path";
 import { chromium } from "playwright";
-import type { Finding, Run, RunReport, Severity } from "../types";
+import type { Finding, RootCauseCluster, Run, RunReport, Severity } from "../types";
 import { getRun, getProject, listFindings, listEvents } from "../db";
+import { plainImpact } from "../plain";
+import { loadFeedbackMap, partitionByFeedback } from "./feedback";
+import { deriveAgentView } from "../report-view";
 
 // ---- Plain-language reference tables ------------------------------------
 
@@ -44,9 +47,17 @@ const AGENT_PURPOSE: Record<string, string> = {
   orchestrator: "The conductor - starts agents, tracks sessions, assembles this report.",
 };
 
-/** Best-guess cause, keyed off finding content - labelled as assumption in the report. */
+/**
+ * Best-guess cause, keyed off finding content - labelled as assumption in the report.
+ * Title matched first; detail only as fallback — details quote foreign text (console
+ * errors, URLs) that used to make first-match-wins pick another finding's cause.
+ */
 export function assumedCause(f: Pick<Finding, "agent" | "title" | "detail">): string {
-  const t = `${f.title} ${f.detail}`.toLowerCase();
+  return causeFor(f.title.toLowerCase()) ?? causeFor(`${f.title} ${f.detail}`.toLowerCase())
+    ?? "No single obvious cause from black-box evidence - the detail above quotes exactly what was observed; reproduce with the same role and URL to narrow it down.";
+}
+
+function causeFor(t: string): string | null {
   if (/50[24]|timeout|timed out/.test(t)) return "The server took too long or gave up - usually an overloaded backend, a slow database query, or an upstream API timing out. Server logs around this run's timestamps will show the real culprit.";
   if (/csrf|cookie/.test(t)) return "The session/CSRF cookie is missing hardening flags (HttpOnly / Secure / SameSite). This is a server configuration change, usually one line in the auth setup.";
   if (/button-name|discernible text/.test(t)) return "Icon-only buttons with no accessible label - screen-reader users hear 'button' with no idea what it does. Add aria-label to each.";
@@ -60,7 +71,22 @@ export function assumedCause(f: Pick<Finding, "agent" | "title" | "detail">): st
   if (/canonical|meta description|open graph|viewport/.test(t)) return "Missing head/meta tags - a shared SEO/head component gap, fixable centrally.";
   if (/failed network request|console error/.test(t)) return "The page depends on API calls that are failing - fix the failing endpoint(s) and these clear up together (see the root-cause section).";
   if (/session state|logged in|login/.test(t)) return "Authentication/session issue - credentials, expiry, or the login flow itself.";
-  return "No single obvious cause from black-box evidence - the detail above quotes exactly what was observed; reproduce with the same role and URL to narrow it down.";
+  return null;
+}
+
+/**
+ * Surface a finding's existing `confidence` field in words (PLAN-REPORT-TRUST §4).
+ * Not a new scoring system — deterministic checks are already 1.0 and stay
+ * unannotated (noise); this only names WHY anything below that is less certain,
+ * so a 0.5 inference never reads the same as an axe rule failure.
+ */
+function confidenceLine(f: Pick<Finding, "confidence" | "source">): string | null {
+  if (f.confidence >= 1) return null;
+  const pct = Math.round(f.confidence * 100);
+  const why = f.source === "ai"
+    ? "an AI review judgment weighing the evidence, not a rule violation"
+    : "an inference from observed behaviour (e.g. a click that produced no visible effect), not a rule violation";
+  return `- **Confidence:** reported at lower confidence (${pct}%) — ${why}.`;
 }
 
 const SEV_ORDER: Severity[] = ["critical", "high", "medium", "low", "info"];
@@ -79,6 +105,71 @@ const esc = (s: string): string => s.replace(/\|/g, "\\|").replace(/\r?\n/g, " "
 function dur(ms: number): string {
   const m = Math.floor(ms / 60000), s = Math.round((ms % 60000) / 1000);
   return m ? `${m}m ${s}s` : `${s}s`;
+}
+
+/**
+ * Fold a root-cause cluster's member findings underneath it (P7 completion).
+ *
+ * The root-cause agent already says "5 pages broken by one cause: GET /api/jobs",
+ * but every symptom finding it summarizes stayed in the report next to it — so the
+ * report listed the symptoms AND the explanation, and a reader counted the same
+ * bug six times. Here each cluster claims its members, which then appear as that
+ * cluster's evidence instead of as separate issues.
+ *
+ * Deliberately conservative, because wrongly absorbing a finding HIDES it:
+ * only symptom-reporting agents are eligible (an a11y or security finding on a
+ * page that happens to share a broken endpoint is its own, unrelated bug), the
+ * finding must be on one of the cluster's own pages, and its text must actually
+ * mention the cluster's signature. Anything that fails a test stays visible.
+ * Pure — selftested.
+ */
+const ABSORBABLE_AGENTS = new Set(["route-health"]);
+
+export function absorbRootCauseMembers(
+  findings: Finding[],
+  clusters: RootCauseCluster[]
+): { visible: Finding[]; membersBySignature: Map<string, Finding[]> } {
+  const membersBySignature = new Map<string, Finding[]>();
+  if (!clusters.length) return { visible: findings, membersBySignature };
+
+  const claimed = new Set<Finding>();
+  for (const c of clusters) {
+    const pages = new Set(c.pages);
+    // Both sides must be folded the SAME way before comparing, and the two cluster
+    // kinds fold differently: an API signature carries route placeholders (`/jobs/:n`)
+    // while the finding quotes the real id (`/jobs/42`), whereas a console signature
+    // was already normalized by the root-cause agent (URLs → "URL", digits → "N").
+    const foldApi = (s: string): string => s.replace(/:[a-z]+/gi, "N").replace(/\d+/g, "N").replace(/\s+/g, " ").toLowerCase();
+    const foldConsole = (s: string): string => s.replace(/https?:\/\/\S+/g, "URL").replace(/\d+/g, "N").replace(/\s+/g, " ").toLowerCase();
+    const fold = c.kind === "api" ? foldApi : foldConsole;
+    const needle = fold(c.kind === "api" ? c.signature.split(/\s+/).pop() ?? c.signature : c.signature);
+    const members = findings.filter(
+      (f) =>
+        !claimed.has(f) &&
+        ABSORBABLE_AGENTS.has(f.agent) &&
+        f.pageUrl != null &&
+        pages.has(f.pageUrl) &&
+        needle.length > 3 &&
+        fold(`${f.title} ${f.detail}`).includes(needle)
+    );
+    if (!members.length) continue;
+    for (const m of members) claimed.add(m);
+    membersBySignature.set(c.signature, members);
+  }
+  return { visible: findings.filter((f) => !claimed.has(f)), membersBySignature };
+}
+
+/** The absorbed symptoms behind a root-cause issue, rendered as its evidence. */
+function supportingEvidenceLines(key: Finding, membersBySignature: Map<string, Finding[]>): string[] {
+  if (key.agent !== "root-cause") return [];
+  // The cluster's signature is the tail of the root-cause title ("N pages broken by one cause: <sig>").
+  const sig = key.title.split("one cause: ")[1] ?? "";
+  const members = membersBySignature.get(sig) ?? [];
+  if (!members.length) return [];
+  const lines = [`- **Supporting evidence:** ${members.length} symptom finding(s) folded into this one issue (they are not counted separately above):`];
+  for (const m of members.slice(0, 8)) lines.push(`    - ${m.title}${m.pageUrl ? ` — \`${m.pageUrl}\`` : ""}`);
+  if (members.length > 8) lines.push(`    - ...and ${members.length - 8} more`);
+  return lines;
 }
 
 /** Dedupe findings that are the same issue seen on many pages/browsers. */
@@ -100,9 +191,45 @@ function groupFindings(findings: Finding[]): { key: Finding; title: string; coun
 }
 
 /** Pure builder - full Markdown report from run data. Exported for tests. */
-export function buildReportMarkdown(run: Run, projectName: string, baseUrl: string, findings: Finding[], events: { agent: string; level: string; message: string }[]): string {
+export function buildReportMarkdown(run: Run, projectName: string, baseUrl: string, findings: Finding[], events: { agent: string; level: string; message: string; data?: string | null }[]): string {
   const report: RunReport | null = run.reportJson ? (JSON.parse(run.reportJson) as RunReport) : null;
   const L: string[] = [];
+
+  // Human feedback (Plan-v8 §3.3): suppressed findings are never deleted from the
+  // findings table — re-bucketed here, at display time, into a dedicated section so
+  // the rest of this function (counts, grouping, role chapters) only ever sees what
+  // a human hasn't already dismissed. `findings` is reassigned to `visible` so every
+  // existing computation below stays correct without a second pass over the data.
+  const origin = (() => { try { return new URL(baseUrl).origin; } catch { return baseUrl; } })();
+  const feedback = partitionByFeedback(findings, loadFeedbackMap(origin));
+  const confirmedFingerprints = feedback.confirmed;
+  const suppressedFindings = feedback.suppressed;
+  findings = feedback.visible;
+
+  // Root-cause member absorption (P7 completion): symptoms move under the cause
+  // that explains them, so the counts below describe ISSUES, not repeated symptoms.
+  const absorbed = absorbRootCauseMembers(findings, report?.rootCauses ?? []);
+  const clusterMembers = absorbed.membersBySignature;
+  const absorbedCount = [...clusterMembers.values()].reduce((n, m) => n + m.length, 0);
+  findings = absorbed.visible;
+
+  // One skip list for the whole document (PLAN-REPORT-TRUST §2). Two sections render
+  // it — the narrative's "deliberately not tested" and the agent table's footer — and
+  // when each filtered for itself they drifted: the table hid a late agent while the
+  // narrative still called it skipped. Derived from evidence, not from stored lists:
+  // an agent in `agentsRan` ran, and an agent that produced a finding demonstrably
+  // ran too, whatever `agentsSkipped` was told at serialization time.
+  const findingsByAgent = new Map<string, number>();
+  for (const f of findings) findingsByAgent.set(f.agent, (findingsByAgent.get(f.agent) ?? 0) + 1);
+  // P1-17: same shared derivation the dashboard uses — the two can't drift apart.
+  const trulySkipped = report ? deriveAgentView(report, findingsByAgent.keys()).skipped : [];
+
+  // Cross-model verification (Plan-v8 §4.2): a second model's "refuted" verdict
+  // demotes a finding to its own section (never deleted); "confirmed"/"uncertain"
+  // just tag the finding where it already lives.
+  const verifyByFingerprint = new Map((report?.crossModelVerifications ?? []).map((v) => [v.fingerprint, v]));
+  const refutedFindings = findings.filter((f) => verifyByFingerprint.get(f.fingerprint)?.verdict === "refuted");
+  findings = findings.filter((f) => verifyByFingerprint.get(f.fingerprint)?.verdict !== "refuted");
   const roles = [...new Set([...(report?.sessions.map((s) => s.role) ?? []), ...findings.map((f) => f.role).filter((r): r is string => !!r)])];
   const started = new Date(run.startedAt), finished = run.finishedAt ? new Date(run.finishedAt) : null;
   const aiDown = events.some((e) => e.message.startsWith("AI LAYER DOWN"));
@@ -120,7 +247,13 @@ export function buildReportMarkdown(run: Run, projectName: string, baseUrl: stri
   L.push(`| Duration | ${finished ? dur(finished.getTime() - started.getTime()) : "still running"} |`);
   L.push(`| Verdict | **${run.status.toUpperCase()}** |`);
   L.push(`| AI review layer | ${aiDown ? "WARNING: CONFIGURED BUT DOWN - deterministic checks only" : aiOff ? "off (no API key / quick mode)" : run.aiTokens > 0 ? `on (${run.aiTokens.toLocaleString()} tokens used)` : "off"} |`);
-  L.push(`| Total findings | ${findings.length} (${SEV_ORDER.map((s) => `${bySev.get(s) ?? 0} ${s}`).join(", ")}) |`);
+  L.push(`| Total findings | ${findings.length} (${SEV_ORDER.map((s) => `${bySev.get(s) ?? 0} ${s}`).join(", ")})${suppressedFindings.length ? ` — plus ${suppressedFindings.length} human-suppressed, see below` : ""} |`);
+  // Provenance: a run someone drove by hand is still useful, but a reader must
+  // not take its findings as "the app did this unattended".
+  const touched = findings.filter((f) => f.afterHuman).length;
+  if (run.humanTakeoverAt) {
+    L.push(`| Manual control | a human took the live view's wheel at ${new Date(run.humanTakeoverAt).toLocaleString()} - ${touched} finding(s) recorded after that point are marked below |`);
+  }
   L.push("");
 
   L.push(`## How to read this report`);
@@ -144,12 +277,60 @@ export function buildReportMarkdown(run: Run, projectName: string, baseUrl: stri
     }
   }
   L.push(`The ${groups.length} distinct issues (many repeat across pages/browsers), worst first:`);
+  if (absorbedCount) {
+    L.push("");
+    L.push(`${absorbedCount} symptom finding(s) are **not** listed separately: they were folded under the root cause that explains them, and appear as that issue's supporting evidence. Fixing the cause clears all of them.`);
+  }
   L.push("");
   L.push(`| Severity | Issue | Found by | Seen |`);
   L.push(`|---|---|---|---|`);
   for (const g of groups.slice(0, 15)) L.push(`| ${g.key.severity} | ${esc(g.title)} | ${g.key.agent} | ${g.count}x |`);
   if (groups.length > 15) L.push(`| | ...and ${groups.length - 15} more distinct issues (full list below) | | |`);
   L.push("");
+
+  // Mission narrative (PLAN-REPORT-TRUST §3): what the fleet did to find this,
+  // so a reader can judge the audit, not just the finding list. Assembly only —
+  // every fact here (mission.reason, run_events durations, skip reasons) was
+  // already computed elsewhere; this just makes it legible in one place.
+  if (report) {
+    L.push(`## How this was tested`);
+    L.push("");
+    L.push(
+      `**Mission:** ${run.mode} mode${report.missionReason ? ` — ${report.missionReason}` : ""}. ` +
+      `Page selection is deterministic and risk-weighted (admin/checkout/recently-changed pages first) — never random, never AI-chosen` +
+      `${report.sampleSize ? `; up to ${report.sampleSize} page(s) sampled per role` : ""}.`
+    );
+    L.push("");
+    const stageOrder: string[] = [];
+    const stageTotals = new Map<string, { durationMs: number; findings: number; failed: boolean }>();
+    for (const e of events) {
+      if (e.level !== "agent-done") continue;
+      let d: { durationMs?: number; findings?: number; failed?: boolean } = {};
+      try { d = JSON.parse(e.data ?? "{}"); } catch { /* malformed data — treat as unknown */ }
+      if (!stageTotals.has(e.agent)) stageOrder.push(e.agent);
+      const t = stageTotals.get(e.agent) ?? { durationMs: 0, findings: 0, failed: false };
+      t.durationMs += d.durationMs ?? 0;
+      t.findings += d.findings ?? 0;
+      t.failed = t.failed || !!d.failed;
+      stageTotals.set(e.agent, t);
+    }
+    if (stageOrder.length) {
+      L.push(`**Timeline** (in the order each stage ran):`);
+      L.push("");
+      for (const agent of stageOrder) {
+        const t = stageTotals.get(agent);
+        if (!t || agent === "recorder") continue;
+        L.push(`1. ${agent}${t.failed ? " (failed)" : ""} — ${dur(t.durationMs)}, ${t.findings} finding(s)`);
+      }
+      L.push("");
+    }
+    L.push(`**Deliberately not tested:**`);
+    L.push("");
+    for (const a of trulySkipped) L.push(`- ${a.name} — ${a.reason}`);
+    L.push(`- Everything past the mode caps above (page sample size, controls/page, adopted-route limit) — absence of a finding on an untested page is not evidence the page is fine.`);
+    L.push(`- Server-side logs, database state, and anything not observable from the browser — outside this run's boundary by design (black-box testing).`);
+    L.push("");
+  }
 
   // Sessions / what was tested.
   if (report) {
@@ -161,7 +342,25 @@ export function buildReportMarkdown(run: Run, projectName: string, baseUrl: stri
     L.push("");
     if (report.coverageTotals) {
       const c = report.coverageTotals;
-      L.push(`Coverage: **${c.pagesTested} of ${c.pagesDiscovered} discovered pages tested** (${c.templatesTested}/${c.templatesDiscovered} unique page types), **${c.controlsClicked} of ${c.controlsSeen} interactive controls clicked**.`);
+      // Denominators are derived, not trusted (PLAN-REPORT-TRUST §1). The producer
+      // unions discovered ∪ tested so a >100% ratio can't happen any more, but a
+      // report_json stored BEFORE that fix still holds one ("115 of 114"), and a
+      // reader who sees an impossible ratio stops believing every other number here.
+      const pagesDiscovered = Math.max(c.pagesDiscovered, c.pagesTested);
+      const templatesDiscovered = Math.max(c.templatesDiscovered, c.templatesTested);
+      L.push(`Coverage: **${c.pagesTested} of ${pagesDiscovered} discovered pages tested** (${c.templatesTested}/${templatesDiscovered} unique page types), **${c.controlsClicked} of ${c.controlsSeen} interactive controls clicked**.`);
+      L.push("");
+    }
+    if (report.owaspCoverage?.length) {
+      L.push(`### OWASP Top 10 2021 coverage`);
+      L.push("");
+      L.push(`| Category | Tested | Findings |`);
+      L.push(`|---|---|---|`);
+      for (const r of report.owaspCoverage) {
+        L.push(`| ${r.category} ${r.label} | ${r.tested === null ? `not tested${r.notTestedReason ? ` (${esc(r.notTestedReason)})` : ""}` : r.tested} | ${r.findings} |`);
+      }
+      L.push("");
+      L.push(`"Not tested" is reported honestly rather than guessed — see the categories' own explanation above.`);
       L.push("");
     }
   }
@@ -174,9 +373,6 @@ export function buildReportMarkdown(run: Run, projectName: string, baseUrl: stri
     if (e.level === "step") s.steps++; else if (e.level === "pass") s.pass++; else if (e.level === "fail") s.fail++; else s.warn++;
     agentStats.set(e.agent, s);
   }
-  const findingsByAgent = new Map<string, number>();
-  for (const f of findings) findingsByAgent.set(f.agent, (findingsByAgent.get(f.agent) ?? 0) + 1);
-
   L.push(`## What each agent did`);
   L.push("");
   L.push(`| Agent | Job (plain language) | Activity | Findings |`);
@@ -186,8 +382,8 @@ export function buildReportMarkdown(run: Run, projectName: string, baseUrl: stri
     L.push(`| ${agent} | ${AGENT_PURPOSE[agent] ?? "-"} | ${s.steps} steps, ${s.pass} passes, ${s.fail} fails, ${s.warn} warnings | ${findingsByAgent.get(agent) ?? 0} |`);
   }
   L.push("");
-  if (report?.agentsSkipped.length) {
-    L.push(`**Agents that did not run** (and why): ${report.agentsSkipped.map((a) => `${a.name} (${a.reason})`).join("; ")}.`);
+  if (trulySkipped.length) {
+    L.push(`**Agents that did not run** (and why): ${trulySkipped.map((a) => `${a.name} (${a.reason})`).join("; ")}.`);
     L.push("");
   }
 
@@ -208,10 +404,16 @@ export function buildReportMarkdown(run: Run, projectName: string, baseUrl: stri
       for (const g of sevGroups) {
         L.push(`**${g.title}**${g.count > 1 ? ` - seen ${g.count}x across ${g.pages.length} page(s)` : ""}`);
         L.push("");
+        const plain = plainImpact(g.key);
+        if (plain) L.push(`- **What it means:** ${esc(plain)}`);
         L.push(`- **What happened:** ${esc(g.key.detail.slice(0, 500))}`);
         if (g.pages.length) L.push(`- **Where:** ${g.pages.slice(0, 5).map((p) => `\`${p}\``).join(", ")}${g.pages.length > 5 ? ` ...and ${g.pages.length - 5} more` : ""}`);
+        const confLine = confidenceLine(g.key);
+        if (confLine) L.push(confLine);
         L.push(`- **Likely cause (assumption):** ${assumedCause(g.key)}`);
-        L.push(`- **Found by:** ${g.key.agent} agent${g.key.source === "ai" ? " (AI review)" : ""}`);
+        for (const line of supportingEvidenceLines(g.key, clusterMembers)) L.push(line);
+        const verify = verifyByFingerprint.get(g.key.fingerprint);
+        L.push(`- **Found by:** ${g.key.agent} agent${g.key.source === "ai" ? " (AI review)" : ""}${g.key.afterHuman ? " - **after manual control**: a human had driven the browser before this was seen, so the page state was not reached by agents alone" : ""}${confirmedFingerprints.has(g.key.fingerprint) ? " - **previously confirmed by a human reviewer**" : ""}${verify?.verdict === "confirmed" ? " - **cross-model verified**" : verify?.verdict === "uncertain" ? " - single-model (a second model's review was inconclusive)" : ""}`);
         L.push("");
       }
     }
@@ -227,8 +429,39 @@ export function buildReportMarkdown(run: Run, projectName: string, baseUrl: stri
     for (const g of groupFindings(siteWide)) {
       L.push(`**[${g.key.severity}] ${g.title}**${g.count > 1 ? ` - ${g.count}x` : ""}`);
       L.push("");
+      const plainSite = plainImpact(g.key);
+      if (plainSite) L.push(`- **What it means:** ${esc(plainSite)}`);
       L.push(`- **What happened:** ${esc(g.key.detail.slice(0, 500))}`);
+      const confLineSite = confidenceLine(g.key);
+      if (confLineSite) L.push(confLineSite);
       L.push(`- **Likely cause (assumption):** ${assumedCause(g.key)}`);
+      L.push("");
+    }
+  }
+
+  // Human-reviewed suppressions (Plan-v8 §3.3) — never deleted, always visible for
+  // auditability, just collapsed out of the counts and chapters above.
+  if (suppressedFindings.length) {
+    L.push(`## Suppressed (human-reviewed)`);
+    L.push("");
+    L.push(`${suppressedFindings.length} finding(s) below were marked false-positive or intended behavior by a human reviewer (\`npm run agents -- feedback\`) and are excluded from the counts and chapters above. They are never deleted and reappear here every run until the verdict changes.`);
+    L.push("");
+    for (const { finding: f, reason } of suppressedFindings) {
+      L.push(`**[${f.severity}] ${esc(f.title)}** - ${esc(reason)}`);
+      L.push("");
+    }
+  }
+
+  // Cross-model refutations (Plan-v8 §4.2) — never deleted, demoted here with the
+  // second model's reasoning so a human can still overrule it.
+  if (refutedFindings.length) {
+    L.push(`## Unverified (refuted by a second model)`);
+    L.push("");
+    L.push(`${refutedFindings.length} AI-sourced finding(s) below were reviewed by a second, different model (\`AI_VERIFY_MODEL\`), which found the evidence did not support them. Kept here rather than deleted — verify by hand if in doubt.`);
+    L.push("");
+    for (const f of refutedFindings) {
+      const reason = verifyByFingerprint.get(f.fingerprint)?.reason || "no reason given";
+      L.push(`**[${f.severity}] ${esc(f.title)}** - ${esc(reason)}`);
       L.push("");
     }
   }

@@ -1,4 +1,10 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+Webtester — a local autonomous black-box regression assistant with deterministic checks and optional AI-assisted review.
+
+> **Deployment boundary: local, single trusted user only.** There is no application
+> authentication, no tenant isolation, and runtime artifacts (screenshots, traces)
+> are served from `public/`. Do not expose this to untrusted users or deploy it to
+> Vercel/serverless — in-process background runs and writable SQLite are
+> incompatible with that runtime. See `WEBTESTER-AUDIT.md`.
 
 ## Getting Started
 
@@ -6,15 +12,9 @@ First, run the development server:
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3400](http://localhost:3400) with your browser to see the result.
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
@@ -42,13 +42,11 @@ You can check out [the Next.js GitHub repository](https://github.com/vercel/next
 ## Known limitations (Phase 1)
 
 - **No CAPTCHA/2FA/OTP bypass** — the login agent fills username+password and submits; if the target requires a captcha or one-time code it reports "Login failed" rather than solving it. Use a test env with these disabled, or storage-state/session-cookie injection.
-- **CRUD agent not implemented** — mutating writes need a data factory + env snapshot/reset (Phase 5); today's agents are read-only/non-destructive by design.
+- **CRUD agent** — implemented with tagged disposable entities (`qabot-…`); destructive steps are skipped on production targets.
 - **Custom JS audio players** — media verification covers real `<audio>`/`<video>` elements; playback driven purely by `new Audio()` in JS is only caught indirectly (dead-control heuristics).
 - **No video recording** — screenshots, console logs, and network capture are recorded per run; full video is not.
 - **Role sessions capped** — at most `MAX_SIMULTANEOUS_ROLE_SESSIONS` (6) roles run concurrently per project (see `src/lib/runner/orchestrate.ts`) to bound browser memory use.
 
 
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Deployment: intentionally none. Run it locally (`npm run dev` / `npm run build && npm run start`, port 3400). See the deployment boundary note at the top.

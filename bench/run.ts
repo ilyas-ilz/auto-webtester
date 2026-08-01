@@ -4,9 +4,11 @@ import path from "path";
 import { createSaasApp } from "./apps/saas";
 import { createContentApp } from "./apps/content";
 import { createSpaApp } from "./apps/spa";
+import { createUiApp } from "./apps/ui";
 import { createProject, getProject, listFindings } from "../src/lib/db";
 import { runProject } from "../src/lib/runner/orchestrate";
 import { scoreBench, formatBenchReport, type SeededDefect, type BenchScore } from "../src/lib/runner/benchScore";
+import { loadFeedbackMap } from "../src/lib/runner/feedback";
 import type { Project, RunMode } from "../src/lib/types";
 
 // Plan-v6 V9: `npm run bench` — runs the fleet against 3 tiny seeded-defect
@@ -52,6 +54,17 @@ const APPS: BenchApp[] = [
       roles: [], journeys: [],
     }),
   },
+  {
+    // UI / responsive / mobile fault app. Some of its defects are visible only on a
+    // phone viewport, so `npm run bench -- ui` in the default quick mode (desktop
+    // only) is EXPECTED to miss them — run BENCH_MODE=smart to add Mobile Chrome.
+    key: "ui", name: "bench: SaaS UI (layout/responsive)", port: 4804, create: createUiApp,
+    project: (baseUrl) => ({
+      name: "bench: SaaS UI (layout/responsive)", baseUrl, envTag: "localhost", loginPath: "/login",
+      registerPath: "", testInboxUrl: "", sessionState: "", notes: "seeded UI/responsive-defect benchmark app", requirements: "", uploadFilePath: "", repoPath: "",
+      roles: [], journeys: [],
+    }),
+  },
 ];
 
 function listen(server: http.Server, port: number): Promise<void> {
@@ -93,7 +106,10 @@ async function main(): Promise<void> {
     const started = Date.now();
     const runId = await runProject(project, mode);
     const findings = listFindings(runId);
-    const score = scoreBench(defects, findings);
+    // Plan-v8 §3.3: reviewer-marked FPs count against precision in the bench numbers.
+    const feedback = loadFeedbackMap(new URL(project.baseUrl).origin);
+    const suppressed = new Set([...feedback].filter(([, e]) => e.verdict !== "confirmed").map(([fp]) => fp));
+    const score = scoreBench(defects, findings, suppressed);
     scores.push({ app: app.key, score });
     console.log(formatBenchReport(app.key, score));
     console.log(`  run ${runId} (${Math.round((Date.now() - started) / 1000)}s) — inspect at /projects/${project.id}/runs/${runId}\n`);

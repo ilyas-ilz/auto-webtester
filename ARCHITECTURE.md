@@ -1,6 +1,6 @@
 # webtester — Architecture & How It Works
 
-> Status: current as of 2026-07-16. Includes Plan-v3 fixes (login transparency, anonymous fallback, structured report), **Plan-v4 batches 1+2** (risk sampling, multi-run memory, parallel verification, coverage totals, journey engine, senior reviewer, root-cause correlation, fault injection, input fuzzing, browser chaos), **and Plan-v5 batches 1+2** — batch 1: requirement-validation, SEO, adaptive sampling; batch 2: API response validation, analytics detection, memory-leak probe, file-upload, email flows, AI explorer, per-step journey assertions, recovery testing. Remaining boundary rejects are in §17.
+> Status: current as of **2026-07-28**. Plan-v3 (login transparency, anonymous fallback, structured report) · **v4** (risk sampling, multi-run memory, parallel verification, coverage totals, journey engine, senior reviewer, root-cause correlation, fault injection, fuzzing, chaos) · **v5** (requirement validation, SEO, adaptive sampling, API validation, analytics, memory-leak, file upload, email flows, AI explorer, recovery testing) · **v6** (repo-aware root cause, git-diff regression focus, seeded-defect bench) · **v7 — application-intelligence layer** (§7A: semantic snapshot, write-IDOR oracle, entity lifecycle, fact store, safe probing, deterministic recovery, behavioral contracts) · **v8 — cross-run brain** (§7B: experience store, human feedback, multi-model verification, MCP server, OWASP mapping). Remaining boundary rejects are in §17.
 
 webtester is a local Next.js app that points a fleet of Playwright agents at any target website and tests it the way a QA team would: log in as every configured role, crawl and click through the app, verify routes/forms/accessibility/performance/security/visuals deterministically, drive user-defined **business journeys** with an AI Navigator, break the site on purpose (fault injection, chaos), then let an AI layer judge what heuristics can't and a senior-QA AI pass sign off on the whole run. Everything lands in SQLite as findings with screenshot evidence; each run ends with a structured coverage report plus recurrence patterns and root-cause clusters.
 
@@ -15,7 +15,9 @@ UI "Run" button ──▶ startRun() ──▶ executeRun(runId, project, mode) 
       (or CLI: npm run agents -- --url ...)
 
 executeRun:
-  planMission(mode)                      ← scopes everything: agents, sample size, AI budget, devices
+  loadExperience(origin)                 ← v8 §7B: everything previous runs learned about THIS site
+  recallFacts() → ctx.facts              ←   pre-seeds the fact store, so known things aren't re-probed
+  planMission(mode, experience)          ← scopes everything: agents, sample size, AI budget, devices
   snapshot prior page labels             ← for change detection (§10)
   launch browser engines needed
   │
@@ -59,6 +61,10 @@ executeRun:
   │
   ├─ regression agent                    (fingerprint diff vs previous run + multi-run patterns)
   │
+  ├─ crossModelVerify (v8 §7B)           (AI-sourced high-severity findings re-judged by a 2nd model)
+  │
+  ├─ saveExperience(ctx, origin)         (v8 §7B: facts + recoveries + framework → experience table)
+  │
   └─ FINISH: buildRunReport() + computeCoverageTotals() + patterns → runs.report_json
      senior-review agent (AI) reads the assembled report → report.seniorReview + info finding
      summary = headline + ✓/✗ per-role session lines + top-8 issue digest
@@ -70,6 +76,21 @@ Every agent call is wrapped in `withRecovery` (§11): throw → retry once → r
 ---
 
 ## 2. Run modes & the Mission Planner (`planner.ts`)
+
+### Who decides what gets tested — not an AI, and not randomly
+
+This is the most common question about the tool, so it is worth stating precisely: **no model chooses the test plan, and nothing is picked at random.** Scope is decided by deterministic code before the browser opens, in this order:
+
+1. **Mode → capability set.** `planMission(mode)` maps quick/smart/full to a fixed agent list, pages-per-agent, device profiles, and AI token budget (table below). Same mode + same site = same plan.
+2. **Conditional agents → data-driven, not judgement.** `permissions` needs ≥2 roles, `register` needs a signup path, `journey` needs journeys defined, `crud` needs full mode **and** a non-production `envTag`. Each skip is recorded with its reason in the mission's `reason` string, printed at run start.
+3. **Which pages → risk score, not the first N.** `ctx.sampleFor(role, n)` ranks every discovered page by `riskScore(pathname)` (checkout/admin/payment/auth paths outrank `/faq`), **+40 new since last run**, **+20 changed**, **+30 carried a finding recently**, then guarantees at least one page per page *type* so a sample is never six list pages (§5).
+4. **Experience (v8) → prior knowledge, still deterministic.** Recalled rows pre-seed the fact store and append a "known from N previous runs" note to the AI reviewer's prompt. They change what is *skipped* (already-known things aren't re-probed), not who decides.
+
+**Where AI actually enters:** only *after* deterministic work, and only in smart/full with a key — `page-judge` (vision over one screenshot per page type), `ai-reviewer` (whole-site text reasoning), `journey` Navigator, `requirements`, `explorer`, and `senior-review` (executive sign-off over the assembled report). The AI never selects routes, never decides sampling, and cannot suppress a deterministic finding. In quick mode the AI budget is provably 0.
+
+**Consequence, stated honestly:** the plan is repeatable and cheap, but it does not *reason* about the business — it cannot decide "checkout matters more than settings for this particular product". That is the known gap an AI planner would close, and it is the headline v9 item (see `PLAN-V8.md`, deferred section).
+
+### Modes
 
 The planner is deliberately heuristic — no LLM needed to scope a run.
 
@@ -126,7 +147,7 @@ Every sampling agent used to take the first N crawled pages; now they all call `
 
 ---
 
-## 6. The agent fleet (28 agents)
+## 6. The agent fleet (34 agent modules in `src/lib/runner/agents/`)
 
 ### Discovery
 
@@ -137,7 +158,7 @@ Every sampling agent used to take the first N crawled pages; now they all call `
 **interaction** — fills the "crawler only sees `<a href>`" gap; runs **early** so everything it discovers is tested by the agents after it. On each sampled page it clicks up to 12 visible non-link controls, skipping destructive labels via `UNSAFE`, settling 700 ms per click:
 - Click navigates → same-origin, unseen, safe, ≤2 per URL template → the route is **adopted** into `ctx.pages` (cap 8) and queued for probing. This is why button-nav SPAs still get coverage.
 - Click throws a JS error → medium finding with console output.
-- Click visibly does nothing (DOM node-count delta < 2, no nav, no error) → low-confidence "control appears to do nothing" finding.
+- Click visibly does nothing → low-confidence "control appears to do nothing" finding. **This one is an inference, not an observation**, so it must survive every cheap counter-signal before it is stated: a re-render (node delta ≥2), a text swap that keeps the node count identical (language toggle, tab, sort, filter), a network request the click fired, or a navigation. Any single one means the control worked and nothing is reported (`clickDidNothing`, pure, selftested). The node-count-only version flagged a working language switcher on the mployedin run.
 - Mutes and `play()`s up to 3 `<audio>/<video>` elements, verifies `currentTime` advances after 1.5 s — catches players that render but can't play.
 - Feeds `ctx.coverage.controlsSeen / controlsClicked` for the coverage totals (§13).
 
@@ -251,6 +272,46 @@ One AI call **after the report is assembled**, so it sees coverage totals, recur
 
 ---
 
+## 7A. Application-intelligence layer (Plan-v7)
+
+Everything above tests *pages*. This layer builds a verified model of *the application* — what entities exist, what states they move through, who may act on them — so the fleet stops re-deriving the same knowledge every run and can catch bugs that per-page checks structurally cannot. All of it is deterministic; AI is the last resort, not the first.
+
+**`snapshot.ts` — semantic snapshot (§3.1).** A per-element view that fuses the accessibility tree with DOM and geometry: implicit role, W3C-ish accessible name, a relocation `ref` (`role=..[name=..]` › `#id` › `[testid]` › `tag#idx`), and an `isInteresting` predicate that deliberately catches `div[onclick]` and `tabindex≥0` — the controls a raw a11y tree misses. Capped at 600 nodes; main frame plus child frames.
+
+**Canonical state key (Crawljax borrow).** `normName` strips volatile text (digits, hex ids, our own `qabot-` tags), `interactiveShape` reduces a page to its sorted set of `role:name` controls plus landmarks, and `canonicalStateKey` hashes that. Effect: a list with 3 rows and the same list with 5 rows are **one** state, not two — without this, state explosion makes a graph useless. The inverse guard matters as much: two genuinely different control sets must never collapse into one state (a false merge silently hides coverage), and both directions are selftested.
+
+**`facts.ts` — the fact store (§3.4).** A *finding* says "something may be wrong"; a *fact* says "this is how the app behaves". They are deliberately separate: findings go to the report, facts gate escalation. Facts are triples (`subject`/`predicate`/`object`) with evidence, confidence, and provenance, deduped by triple keeping the strongest belief — `observed`/`probed` (4) outrank `code` (3), `inferred` (2), and `ai` (1), so the model can never overwrite something we actually saw.
+
+**`probe.ts` — safe active probing (§3.5).** `shouldProbe` is a boolean gate (on a test path, not already known, and either read-only or a disposable entity exists), and `resolveStrategy` picks `use-known → probe → infer → ai → record-unknown` **in that order**. This is the cost lever: AI is second-to-last by design. Mutating probes are blocked outside non-production `envTag`.
+
+**`lifecycle.ts` — entity lifecycle (§3.3).** Learns state transitions and which role performed each action, then flags **post-terminal** moves (deleted → active), **backward** moves (the reverse of a learned edge), and **wrong-role** actions. Persisted across runs in `lifecycle_transitions`, so run 20 knows what run 1 saw.
+
+**`recovery.ts` — observation quality (§3.6).** `observe()` runs a bounded, ordered recovery ladder; a rung that throws is skipped to the next. Every observation is classified `clean | recovered | ambiguous | failed`, and only `clean`/`recovered` are `isTrustworthy` — the rule is **never learn from unstable execution**. An unverifiable success is `ambiguous`, not `recovered`.
+
+**Write-IDOR oracle (§3.2).** During normal use, mutations we caused (tagged `qabot-<run>-<role>-<n>`, so real data is never a replay target) are captured, then **replayed from every other role's authenticated context**. `classifyWriteIdor` reads owner-2xx + cross-role-2xx as `vulnerable` (critical finding), 404 as `protected`. DELETEs are ordered last so a successful cross-role delete can't destroy the entity before PUT/PATCH is probed. Honest caveat: on CSRF/nonce apps a replayed token returns 403, which is reported `inconclusive` rather than a false "protected" — the real fix (per-role fresh token injection) is still open.
+
+**`contracts.ts` — behavioral contracts (§3.7).** Semantic invariants only (`create-retrievable`, `session-persists`), frozen from clean observations and re-checked in later runs as `pass | fail | inconclusive`. Never UI details, because those flap.
+
+---
+
+## 7B. Cross-run brain (Plan-v8)
+
+v7 made one run smart. v8 makes the *next* run start where the last one finished, and puts a human in the loop.
+
+**Experience store (`experience.ts`, §1–2).** At run end, facts (confidence ≥0.6), successful recoveries, and detected framework/auth style are upserted into the `experience` table keyed by origin; on conflict `run_count` increments and the strongest belief wins. At run start `loadExperience(origin)` recalls them, `recallFacts` pre-seeds the fact store (so the probe gate skips what is already known — fewer probes *and* fewer AI calls on repeat runs), and `summarizeForPrompt` appends a compact "known from N previous runs" block to the AI reviewer's prompt. A `contradicted_at` column is the poison guard: a belief later contradicted is marked, not silently kept. Decay evicts weak single-run rows after 30 days.
+
+**Global patterns (§2).** A recovery whose *site-agnostic* signature recurs across **≥3 distinct origins** at **≥70%** aggregate success is promoted to a `scope='global'` row — knowledge that transfers to a site never seen before. Deliberately not a separate subsystem: a pattern is the same row with a different scope.
+
+**Human feedback (`feedback.ts`, §3).** A reviewer marks a finding once (`npm run agents -- feedback <runId> <findingId> false_positive "reason"`); it is fingerprinted (agent + rule + normalized path + normalized selector, so dynamic ids don't break the match) and thereafter moved into a collapsed **"Suppressed (human-reviewed)"** section of every future report — **never deleted**, always showing the human's reason. `confirmed` verdicts tag the finding as human-confirmed instead. Fingerprints are versioned (`fingerprint_v`), and the regression agent skips one diff on a version bump rather than reporting every pre-existing finding as spuriously new.
+
+**Multi-model verification (§4).** `ai.ts` gained purpose-based routing (`AI_ROUTE`, `AI_VERIFY_MODEL` via OpenRouter; a routed purpose always goes to its pinned model rather than silently falling back). `crossModelVerify` sends **only** AI-sourced, high-severity, not-already-human-confirmed findings to a second model with an adversarial prompt ("try to refute this"). `refuted` demotes the finding into an "Unverified (refuted by a second model)" section — again never deleted. Unset key = zero calls, identical behavior to before.
+
+**MCP server (`mcp.ts`, §5).** `npm run mcp` exposes 7 thin wrappers over existing functions — `run_test`, `get_run_status`, `list_findings`, `get_console_logs`, `get_network_logs`, `capture_screenshot`, `approve_finding`, `search_previous_runs` — over stdio, so Claude Desktop or any MCP client can orchestrate runs. `targetOriginAllowed` restricts `run_test` to loopback unless `MCP_ALLOWED_ORIGINS` widens it: a standing server any client can call must not inherit the CLI's unrestricted reach.
+
+**OWASP mapping (`owasp.ts`, §6).** Security findings carry `owasp: ["A01:2021", …]` tags (CWE→category mapped for ZAP alerts), and the report renders a coverage matrix. Categories we cannot observe black-box (A04 threat modeling, A09 logging, A10 SSRF without a collaborator server) are printed as **"not tested"** with the reason rather than counted as covered — inventing partial coverage would be worse than admitting none. A06 (npm audit, repo-connected only) and A07 (lockout / session-fixation / weak-password probes, gated behind `SEC_PROBE=1` and a safe-username guard) were added to close the two genuinely missing checks.
+
+---
+
 ## 8. Input fuzzing (P9, `fuzz.ts`)
 
 Pure adversarial-input catalogue, reused by CRUD, journey `{edge:*}` tokens, and form-validation: 11 kinds — 5k-char string, RTL Arabic, emoji, XSS probe (`"><img onerror>` — **detection only**), SQL-ish (`' OR 1=1--` — detection only), empty, whitespace, huge/negative numbers, future/leap dates — each tagged with applicable field types. `looksReflectedXss()` flags only when an angle-bracket payload comes back in served HTML **unescaped**. Fully selftested.
@@ -259,7 +320,7 @@ Pure adversarial-input catalogue, reused by CRUD, journey `{edge:*}` tokens, and
 
 ## 9. Findings model
 
-Every finding: `severity` (critical/high/medium/low/info) · `kind` (bug | improvement) · `source` (deterministic | ai) · `confidence` · `title` · `detail` · `pageUrl` · `role` · `evidence` (screenshot path) · `fingerprint`.
+Every finding: `severity` (critical/high/medium/low/info) · `kind` (bug | improvement) · `source` (deterministic | ai) · `confidence` · `title` · `detail` · `pageUrl` · `role` · `evidence` (screenshot path) · `fingerprint` · `fingerprintV` · `afterHuman` (recorded after a human drove the live view — provenance, since the page state is no longer purely the app's doing) · `owasp?`.
 
 Run status gate: **any critical or high finding → run "failed"**; medium/low/info are advisory. The summary digest dedupes same-issue findings across pages/browsers (title minus `[Browser]` prefix) and lists the top 8 distinct issues by severity with occurrence counts.
 
@@ -303,7 +364,11 @@ The plain-text `summary` leads with the headline (`N findings (c critical, h hig
 | `runs` | mode, status (queued/running/passed/failed/error), timestamps, summary, ai_tokens, **report_json** |
 | `run_events` | live timeline: ts, agent, level (step/pass/fail/warn/shot), message — polled by the UI |
 | `findings` | the findings model above; `idx_findings_fp` index for multi-run history |
-| `graph_nodes` / `graph_edges` | knowledge graph (§10), persists across runs per project |
+| `graph_nodes` / `graph_edges` | knowledge graph (§10), persists across runs per project; edges carry `attrs_json` + `confidence` and typed relations (`created_by`/`belongs_to`/`applied_to`/`transitions_to`) so ownership/tenancy questions need no migration |
+| `lifecycle_transitions` | v7 §3.3 — learned entity state moves + acting role, cross-run |
+| `contracts` | v7 §3.7 — frozen behavioral invariants, re-checked each run |
+| `experience` | v8 §1–2 — cross-run site knowledge (`kind` = fact/recovery/framework/timing, `scope` = site/global, `run_count`, `success_count`, `contradicted_at`) |
+| `feedback` | v8 §3 — human verdicts per finding fingerprint per origin, with reason |
 
 Migrations are additive `ALTER TABLE … ADD COLUMN` calls that swallow "duplicate column" — old databases upgrade in place. `getProjectSafe()` blanks passwords/sessionState before anything reaches the client. Screenshots → `public/shots/{runId}/NNN-label.png`; visual baselines → `public/baselines/`.
 
@@ -314,7 +379,11 @@ Migrations are additive `ALTER TABLE … ADD COLUMN` calls that swallow "duplica
 - **Run page** (`LiveRun.tsx`): polls `/api/runs/[id]` + `/events?after=N` + `/findings` every 1.5 s while running. Senior-review card (violet, top) → summary card → coverage report card (sessions, totals, patterns, agents ran/skipped) → findings view (filter by severity/kind/agent, screenshot lightbox) / timeline view (live agent log).
 - **API routes**: `GET /api/runs/[id]`, `GET /api/runs/[id]/events?after=N`, `GET /api/runs/[id]/findings`, `GET /api/projects/[id]/graph` (summary + top-50 risk-sorted nodes).
 - **Project form**: roles, paths, env tag, storage state, notes, acceptance criteria (one per line → requirement-validation agent), journeys (JSON textarea validated by `journeySchema` in actions.ts).
-- **CLI** (`npm run agents -- --url https://… --user u --pass p --mode smart`, or `--demo` for SauceDemo): creates a project, blocks until the run finishes, prints the findings table. Note: CLI-created projects have `journeys: []` (no CLI flag for journeys yet).
+- **CLI** (`npm run agents -- --url https://… --user u --pass p --mode smart`, or `--demo` for SauceDemo): creates a project, blocks until the run finishes, prints the findings table. Note: CLI-created projects have `journeys: []` and a single role (no CLI flag for multi-role; use a small script like `e2e-mployedin.ts` for multi-role targets).
+- **Feedback CLI** (v8 §3): `npm run agents -- feedback <runId> <findingId> confirmed|false_positive|intended ["reason"]`.
+- **MCP server** (v8 §5): `npm run mcp` — stdio transport, 7 tools, loopback-only targets unless `MCP_ALLOWED_ORIGINS` is set.
+- **Live-view control guard** (`originGuard.ts`): the input/questions endpoints drive a browser holding every role's session, so they require same-origin **and** a Host we actually serve (loopback, or `WEBTESTER_ALLOWED_HOSTS`) — Origin===Host alone is not enough, because a DNS-rebound attacker page satisfies it. A configured `WEBTESTER_CONTROL_TOKEN` vouches for hosted setups.
+- **Benchmark** (v6 V9): `npm run bench` — 3 seeded-defect apps, prints detection / critical-recall / unseeded / duplicate rates, plus human-FP rate once reviewer feedback exists. Latest: **18/26 (69%) quick mode, 2026-07-28**.
 
 ---
 
@@ -331,7 +400,9 @@ Migrations are additive `ALTER TABLE … ADD COLUMN` calls that swallow "duplica
 
 ## 16. Self-test
 
-`npm run agents:test` — **31 assert-based sections** over the pure logic: UNSAFE filter, URL templating, route adoption, page-type inference, credential encryption round-trip, fingerprints, risk scoring, regression diff, recovery semantics, device matrix, change detection, format classifiers, visual diff, AI budget=0 in quick, register email/OTP/verify-link extraction, CRUD tag, UI outliers, login error scraping, run report building, risk+recency+history sampling, coverage totals, root-cause clustering, fuzz catalogue + reflected-XSS detector, journey pure parts (digest/target/tokens/destructive-guard), resilience reaction classifier, chaos control selection, SEO tag audit, requirement parsing, API response validation, memory-leak classifier, analytics provider matching. `npx tsc --noEmit` for types.
+`npm run agents:test` — **84 assert-based sections** (2026-07-28) over the pure logic, no browser and no network. The rule is that every new pure function lands with a section, which is why the count tracks the feature history: v1–v5 cover the UNSAFE filter, URL templating, route adoption, page-type inference, credential encryption, fingerprints, risk scoring, regression diff, device matrix, change detection, format classifiers, visual diff, AI-budget-0-in-quick, register/OTP extraction, CRUD tagging, UI outliers, login error scraping, report building, sampling, coverage totals, root-cause clustering, fuzz catalogue, journey internals, resilience/chaos classifiers, SEO audit, requirement parsing, API validation, memory-leak and analytics classifiers; v7 adds the semantic-snapshot derivations, canonical state key (both directions — collapse *and* the false-merge guard), fact-store precedence, probe gate, lifecycle violations, observation quality, write-IDOR classification and contracts; v8 adds experience merge/contradiction/promotion, feedback fingerprinting and partitioning, verify-result classification, OWASP mapping, and the bench human-FP feed.
+
+The sections that exist because a real run proved them necessary are worth calling out, since they encode bugs rather than intentions: **run liveness** (a heartbeat-based verdict, so a long run is never mistaken for an orphan), **root-cause absorption** (whose assertions are mostly about what must *not* be absorbed), and **dead-control corroboration** (a click that changed text or fired a request is the control working). `npx tsc --noEmit` for types; `npm run build` for the app; `npx eslint src/lib` for lint.
 
 ---
 
@@ -358,8 +429,16 @@ Migrations are additive `ALTER TABLE … ADD COLUMN` calls that swallow "duplica
 
 ### Runner infrastructure
 
-- **No job queue / cancellation**: runs execute in-process in the Next.js server (`void executeRun(...)`); the `queued` status exists in the type but is never used, there is no way to stop a running run from the UI, and a server restart orphans a run as "running" forever. The 6-role memory cap is the placeholder for real per-host accounting.
+- **No job queue / cancellation**: runs execute in-process in the Next.js server (`void executeRun(...)`); the `queued` status exists in the type but is never used, there is no way to stop a running run from the UI. The 6-role memory cap is the placeholder for real per-host accounting.
+- **Run liveness is a heartbeat, and that matters more than it looks** (fixed 2026-07-28 after it bit a real run). `runProject` *polls the DB* and returns as soon as `status !== 'running'` — so any process that wrongly declares a run dead makes the caller believe it finished and exit, killing the live fleet. The orphan sweep used to assume "older than 30 minutes ⇒ dead"; a 5-role full run against a remote SaaS exceeds that easily (a *smart* run measured 29m 43s), so merely starting `npm run dev` during a run killed it and discarded everything it had learned. Now the executing process stamps `heartbeat_at` every 20 s and the sweep only reaps a run whose beat is 5 minutes stale (`isRunAbandoned`, selftested).
 - Runs are strictly sequential per project from the UI's perspective — no concurrency control if two runs are launched at once (they'll both write to the same graph tables).
+
+### Report quality (observed on the 2026-07-28 mployedin run — see PLAN-REPORT-TRUST.md)
+
+- ~~**Coverage denominators can exceed 100%**~~ — **FIXED** (PLAN-REPORT-TRUST §1). The run printed *"115 of 114 discovered pages tested"*; pages adopted mid-run by the interaction agent were counted as tested but not added to the discovered total. `computeCoverageTotals` now unions `pages` and `testedUrls` before counting, so `pagesTested > pagesDiscovered` is structurally impossible — locked by a selftest with the exact adopted-route case.
+- ~~**Agent table contradicts the skip list**~~ — **FIXED** (PLAN-REPORT-TRUST §2). `senior-review` could be listed with a finding *and* under "did not run" when it ran after the skip list was first built. The renderer now derives "did not run" by subtracting `agentsRan` from `agentsSkipped` at render time, so a stale stored list can never surface as a contradiction — selftested.
+- ~~**Plain-language explanations can attach to the wrong finding**~~ — **FIXED.** A `ui-audit` clipped-text finding used to render as *"Placeholder or broken values are showing… users see gibberish"* (the data-integrity wording). Cause: both `plainImpact` and `assumedCause` matched over `title + detail` as one string, and a detail quoting foreign text (a console error, a URL, another rule's vocabulary) could win the first match. Both now match the **title first** and fall back to the detail only if nothing matched. Re-checked against the offending findings from the mployedin run: all three now return the clipped-text wording.
+- ~~**No "how this was tested" narrative**~~ — **FIXED** (PLAN-REPORT-TRUST §3). The report now has a "How this was tested" section (mission reason, per-stage timeline from `run_events`, deliberately-not-tested caps) placed right after the executive summary — assembled entirely from data the fleet already collected.
 
 ### Coverage & detection ceilings
 
@@ -369,7 +448,7 @@ Migrations are additive `ALTER TABLE … ADD COLUMN` calls that swallow "duplica
 - Visual baselines **auto-accept** on change (low finding + overwrite) — no approve/reject UI, so a real visual regression is only flagged once.
 - Journey "mobile" persona is viewport-only (no touch events / mobile UA); upgrade to a device-profile context if mobile UA branching matters.
 - Journey Navigator is text-digest-only (no vision per action — screenshots saved for replay but not sent to the model); add per-action vision if the digest proves too thin.
-- Root-cause clusters don't back-mark member findings' rows (no findings-update path) — the synthesis finding lists members instead.
+- Root-cause clusters don't back-mark member findings' *rows* (no findings-update path). Since 2026-07-28 the **report** folds them anyway: `absorbRootCauseMembers` (pure, selftested) moves each cluster's symptom findings under the cause as "Supporting evidence", so a reader counts issues rather than symptoms. Measured on the mployedin run: **160 of 472 findings absorbed, 28 clusters claiming members**. Deliberately conservative — only symptom-reporting agents (`route-health`) are eligible, the finding must be on one of the cluster's own pages, and its text must match the signature; wrongly absorbing a finding would *hide* it.
 - Crawler caps (40 pages, 8 adopted routes, 12 controls/page) mean very large sites get sampled, not exhausted — by design, but worth knowing.
 
 ### Product

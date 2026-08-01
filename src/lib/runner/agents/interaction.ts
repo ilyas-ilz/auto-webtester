@@ -1,6 +1,7 @@
 import type { BrowserContext, Page } from "playwright";
 import type { RoleCred } from "../../types";
 import { RunContext, scrollToBottom, type CrawledPage } from "../context";
+import { RunCancelledError } from "../control";
 import { UNSAFE, urlTemplate } from "./crawler";
 import { recordPageNode } from "../graph";
 
@@ -20,6 +21,24 @@ const MAX_ADOPTED = 8; // ponytail: cap on click-discovered routes per role — 
  * it's the browser reporting a failed network request. Only the former justifies
  * "clicking this control is broken" — the latter is reported by route-health per page.
  */
+/**
+ * Did this click really do nothing? Corroboration before an accusation.
+ *
+ * "The control is dead" is an *inference*, not an observation — unlike an axe rule
+ * failure or a missing cookie flag, which are facts the moment they're seen. So it
+ * has to survive every cheap counter-signal we can collect: a re-render (node
+ * delta), a content swap that keeps the node count identical (language toggle, tab,
+ * sort, filter), a request the click fired, or a navigation. Any one of those means
+ * the control worked and we say nothing. Only a click that moved *nothing* is
+ * reported, and even then at low confidence.
+ *
+ * Pure — selftested. False positives here are expensive: they teach a reader to
+ * distrust the whole report.
+ */
+export function clickDidNothing(s: { nodeDelta: number; textChanged: boolean; requestsFired: number; urlChanged: boolean }): boolean {
+  return s.nodeDelta < 2 && !s.textChanged && s.requestsFired === 0 && !s.urlChanged;
+}
+
 export function isJsError(line: string): boolean {
   if (/^failed to load resource\b/i.test(line.trim())) return false;
   if (/^(net::|access to (fetch|xmlhttprequest))/i.test(line.trim())) return false;
@@ -55,61 +74,135 @@ interface MediaResult {
 // way to prove a search box actually searches.
 const SEARCHABLE = 'input[type="search"], [role="searchbox"], input[placeholder*="search" i], input[placeholder*="filter" i], input[aria-label*="search" i], input[name*="search" i], input[name*="query" i], input[name="q"]';
 
+// A term no real dataset contains — the negative control. A search that returns
+// the same rows for this as for a real term is not filtering on the query.
+const MISS_QUERY = "zqx9vwk";
+const HIT_QUERY = "a"; // single letter: matches something on almost any dataset
+
+/** One measurement of the result region, taken before typing and after each query. */
+export interface SearchProbeSample {
+  url: string;
+  itemCount: number; // size of the largest repeated sibling group = the result list
+  textLen: number; // text length of that region
+  sawQueryRequest: boolean; // a same-origin request carrying the typed term
+}
+
+export type SearchVerdict = "dead" | "ignores-query" | "works" | "inconclusive";
+
 /**
- * Types a query into up to `max` search/filter boxes on the page and watches
- * for ANY observable reaction: URL change (query param), DOM delta, or a new
- * same-origin network request. A search box that reacts to none of those is
- * reported — "the box renders but searching does nothing" is exactly the class
- * of bug users notice first.
+ * Deterministic verdict from three samples: the page before typing, after a
+ * term that should match, and after a nonsense term that should not.
+ *
+ * Reacting is not searching. A box that fires a request but returns the same
+ * rows for "a" and for "zqx9vwk" is wired to nothing that filters — that is
+ * the bug users actually report, and the old any-reaction check passed it.
+ */
+export function searchVerdict(base: SearchProbeSample, hit: SearchProbeSample, miss: SearchProbeSample): SearchVerdict {
+  const changed = (a: SearchProbeSample, b: SearchProbeSample): boolean =>
+    a.url !== b.url || a.itemCount !== b.itemCount || Math.abs(a.textLen - b.textLen) >= 20 || b.sawQueryRequest;
+  if (!changed(base, hit) && !changed(base, miss)) return "dead";
+  // Nothing countable on the page (no list, no text) — can't tell filtering from
+  // a no-op, so say nothing rather than guess.
+  if (base.itemCount === 0 && hit.itemCount === 0 && miss.itemCount === 0 && Math.abs(hit.textLen - base.textLen) < 20) return "inconclusive";
+  const sameResults = hit.itemCount === miss.itemCount && Math.abs(hit.textLen - miss.textLen) < 20;
+  return sameResults ? "ignores-query" : "works";
+}
+
+/** Measures the result region: largest repeated sibling group, else <main>. */
+async function measureResults(page: Page, sawQueryRequest: boolean): Promise<SearchProbeSample> {
+  const m = await page.evaluate(() => {
+    let best = 0;
+    let bestEl: Element | null = null;
+    for (const parent of Array.from(document.querySelectorAll("ul, ol, tbody, [class]")).slice(0, 400)) {
+      const byKey = new Map<string, number>();
+      for (const child of Array.from(parent.children)) {
+        const key = child.tagName + "." + child.className;
+        byKey.set(key, (byKey.get(key) ?? 0) + 1);
+      }
+      for (const n of byKey.values()) if (n > best) { best = n; bestEl = parent; }
+    }
+    const region = bestEl ?? document.querySelector("main, [role='main']") ?? document.body;
+    return { itemCount: best, textLen: ((region as Element).textContent ?? "").replace(/\s+/g, " ").trim().length };
+  }).catch(() => ({ itemCount: 0, textLen: 0 }));
+  return { url: page.url(), ...m, sawQueryRequest };
+}
+
+/**
+ * Types a query into up to `max` search/filter boxes and checks the box really
+ * searches: a matching term and a nonsense term must not produce the same
+ * results. Typing is keystroke-by-keystroke — `fill()` skips keydown/keyup, so
+ * type-ahead filters bound to key events looked dead under the old probe.
  */
 async function probeSearchBoxes(ctx: RunContext, page: Page, role: RoleCred, pageUrl: string, max = 2): Promise<number> {
-  const boxes = await page.locator(SEARCHABLE).all();
+  const count = await page.locator(SEARCHABLE).count().catch(() => 0);
   let probed = 0;
-  for (const box of boxes) {
-    if (probed >= max) break;
+  for (let i = 0; i < count && probed < max; i++) {
+    const box = page.locator(SEARCHABLE).nth(i);
     if (!(await box.isVisible().catch(() => false)) || !(await box.isEditable().catch(() => false))) continue;
     probed++;
     const label = ((await box.getAttribute("placeholder").catch(() => "")) || (await box.getAttribute("aria-label").catch(() => "")) || (await box.getAttribute("name").catch(() => "")) || "search").slice(0, 50);
-    ctx.status(AGENT, `Typing "a" into search box "${label}" as ${role.name}`, { url: pageUrl });
+    ctx.status(AGENT, `Searching "${HIT_QUERY}" / "${MISS_QUERY}" in box "${label}" as ${role.name}`, { url: pageUrl });
 
-    const urlBefore = page.url();
-    const nodesBefore = await page.evaluate(() => document.querySelectorAll("*").length).catch(() => 0);
-    let sawRequest = false;
-    const onReq = (req: { url(): string }): void => {
-      try { if (new URL(req.url()).origin === new URL(urlBefore).origin) sawRequest = true; } catch { /* data:/blob: */ }
-    };
-    page.on("request", onReq);
-    try {
-      await box.click({ timeout: 3000 });
-      await box.fill("a", { timeout: 3000 }); // single letter: matches something on almost any dataset
-      await page.waitForTimeout(900); // debounce window for type-ahead filters
-      await box.press("Enter").catch(() => {});
-      await page.waitForTimeout(1200);
-    } catch {
+    const homeUrl = page.url();
+    const base = await measureResults(page, false);
+
+    // Runs one query and returns what the page looked like afterwards, then
+    // returns to the starting URL so the next query starts from the same state.
+    const runQuery = async (q: string): Promise<SearchProbeSample | null> => {
+      let sawQueryRequest = false;
+      const onReq = (req: { url(): string }): void => {
+        try {
+          const u = new URL(req.url());
+          if (u.origin === new URL(homeUrl).origin && decodeURIComponent(u.search + u.pathname).toLowerCase().includes(q.toLowerCase())) sawQueryRequest = true;
+        } catch { /* data:/blob: */ }
+      };
+      page.on("request", onReq);
+      try {
+        const field = page.locator(SEARCHABLE).nth(i);
+        await field.click({ timeout: 3000 });
+        await field.fill("", { timeout: 3000 });
+        await field.pressSequentially(q, { delay: 40, timeout: 5000 }); // real key events
+        await page.waitForTimeout(900); // debounce window for type-ahead filters
+        await field.press("Enter").catch(() => {});
+        await page.waitForTimeout(1200);
+      } catch {
+        page.off("request", onReq);
+        return null; // box disappeared / covered — not a finding
+      }
       page.off("request", onReq);
-      continue; // box disappeared / covered — not a finding
-    }
-    page.off("request", onReq);
+      const sample = await measureResults(page, sawQueryRequest);
+      if (page.url() !== homeUrl) {
+        await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+        await page.waitForTimeout(SETTLE_MS);
+      }
+      return sample;
+    };
 
-    const nodesAfter = await page.evaluate(() => document.querySelectorAll("*").length).catch(() => nodesBefore);
-    const reacted = page.url() !== urlBefore || Math.abs(nodesAfter - nodesBefore) >= 2 || sawRequest;
-    if (!reacted) {
+    const hit = await runQuery(HIT_QUERY);
+    const miss = hit ? await runQuery(MISS_QUERY) : null;
+    if (!hit || !miss) continue;
+
+    const verdict = searchVerdict(base, hit, miss);
+    if (verdict === "dead") {
       ctx.finding({
         agent: AGENT, severity: "medium", confidence: 0.7, role: role.name, pageUrl,
         title: `Search/filter box "${label}" does not search`,
-        detail: `Typed "a" and pressed Enter in this input: no navigation, no URL change, no DOM change, and no network request followed within ~2s. The box renders but appears to be wired to nothing.`,
+        detail: `Typed "${HIT_QUERY}" and "${MISS_QUERY}" (keystroke by keystroke, then Enter): no navigation, no result change, and no request carrying the term. The box renders but appears to be wired to nothing.`,
         evidence: await ctx.screenshot(page, `${role.name}-dead-search-${label}`),
       });
+    } else if (verdict === "ignores-query") {
+      ctx.finding({
+        agent: AGENT, severity: "medium", confidence: 0.6, role: role.name, pageUrl,
+        title: `Search/filter box "${label}" ignores the query`,
+        detail: `The box reacts, but a real term ("${HIT_QUERY}") and a nonsense term ("${MISS_QUERY}") return the same results (${hit.itemCount} item(s) both times, same result text). Searching runs but does not filter on what was typed.`,
+        evidence: await ctx.screenshot(page, `${role.name}-search-ignores-query-${label}`),
+      });
+    } else if (verdict === "works") {
+      ctx.log(AGENT, "pass", `Search box "${label}" filters on the query (${base.itemCount}→${hit.itemCount} item(s) for "${HIT_QUERY}", ${miss.itemCount} for "${MISS_QUERY}") on ${pageUrl}`);
     } else {
-      ctx.log(AGENT, "pass", `Search box "${label}" reacts (${page.url() !== urlBefore ? "navigated" : sawRequest ? "fired request" : "DOM updated"}) on ${pageUrl}`);
+      ctx.log(AGENT, "step", `Search box "${label}" reacts but has no countable results to compare — no verdict on ${pageUrl}`);
     }
-    // Reset for the next probe on this page.
-    if (page.url() !== urlBefore) {
-      await page.goBack({ timeout: 10000 }).catch(() => {});
-      await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
-    } else {
-      await box.fill("").catch(() => {});
-    }
+    await page.locator(SEARCHABLE).nth(i).fill("").catch(() => {});
   }
   return probed;
 }
@@ -159,6 +252,7 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
   const queue = [...pages];
 
   while (queue.length) {
+    ctx.checkCancelled(); // P1-3: pages × controls × waits is the longest loop in the fleet — stop between pages
     const crawled = queue.shift()!;
     explored++;
     const page = await browserCtx.newPage();
@@ -167,12 +261,14 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
     // findings like `Clicking "ഹോം" throws a JS error → 401 analytics beacon`, which is
     // wrong twice: it isn't a JS error, and the click didn't cause it.
     const consoleErrors: string[] = [];
+    let requestCount = 0;
+    page.on("request", () => { requestCount++; });
     page.on("pageerror", (e) => consoleErrors.push(String(e).slice(0, 200)));
     page.on("console", (m) => { if (m.type() === "error") consoleErrors.push(m.text().slice(0, 200)); });
     page.on("dialog", (d) => void d.dismiss().catch(() => {}));
 
     try {
-      await page.goto(crawled.url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, crawled.url, AGENT);
       await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
       await scrollToBottom(page).catch(() => {}); // mount lazy-loaded controls/players below the fold before probing
 
@@ -211,6 +307,7 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
       ctx.coverage.controlsSeen += locators.length; // P4 coverage: interactive controls discovered
       let tried = 0;
       for (const el of locators) {
+        ctx.checkCancelled(); // P1-3: also stop between control clicks on a control-heavy page
         if (tried >= MAX_ELEMENTS_PER_PAGE) break;
         const visible = await el.isVisible().catch(() => false);
         if (!visible) continue;
@@ -220,6 +317,11 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
 
         const errBefore = consoleErrors.length;
         const nodesBefore = await page.evaluate(() => document.querySelectorAll("*").length).catch(() => 0);
+        // Corroborating signals for the "did nothing" verdict below. Node count alone
+        // is blind to a control that swaps text (language toggle, tab, sort) or fires
+        // a request without re-rendering — both are the control working.
+        const textBefore = await page.evaluate(() => document.body?.innerText?.slice(0, 4000) ?? "").catch(() => "");
+        const reqBefore = requestCount;
         try {
           await el.click({ timeout: 3000 });
         } catch {
@@ -267,9 +369,14 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
           // Something happened AND a request failed — worth saying, but as a failed
           // request, not as a JS exception the click threw.
           ctx.log(AGENT, "step", `Click "${label || "(unlabeled)"}" produced a failed request: ${newErrors[0]}`);
-        } else if (Math.abs(nodesAfter - nodesBefore) < 2) {
-          // ponytail: DOM-node-count delta as the "did anything happen" proxy;
-          // misses pure style/canvas changes — upgrade to MutationObserver if noisy.
+        } else if (clickDidNothing({
+          nodeDelta: Math.abs(nodesAfter - nodesBefore),
+          textChanged: (await page.evaluate(() => document.body?.innerText?.slice(0, 4000) ?? "").catch(() => textBefore)) !== textBefore,
+          requestsFired: requestCount - reqBefore,
+          urlChanged: false, // a changed URL was already handled and `continue`d above
+        })) {
+          // ponytail: still blind to pure style/canvas changes — upgrade to a
+          // MutationObserver if this proves noisy.
           deadControls++;
           ctx.finding({
             agent: AGENT, severity: "low", confidence: 0.5, kind: "improvement", role: role.name, pageUrl: crawled.url,
@@ -282,6 +389,7 @@ export async function interactionAgent(ctx: RunContext, browserCtx: BrowserConte
         await page.keyboard.press("Escape").catch(() => {});
       }
     } catch (e) {
+      if (e instanceof RunCancelledError) throw e; // P1-3: a stop is not an exploration flake — finally still closes the page
       ctx.log(AGENT, "warn", `Exploration failed on ${crawled.url}: ${String(e).slice(0, 160)}`);
     } finally {
       await page.close();

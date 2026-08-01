@@ -42,7 +42,7 @@ export function inferPageType(f: PageFeatures): PageType {
  * the page type, then verifies type-specific invariants:
  *  - every page: renders actual content (catches blank client-side crashes)
  *  - detail/article pages: prev/next navigation really navigates
- *  - search pages: typing a query and submitting visibly changes the page
+ * (search boxes belong to the interaction agent — it runs the hit/miss probe.)
  * Finally it emits a site map — every URL template with its inferred type —
  * which is the "what pages are in it" answer in the report.
  */
@@ -58,7 +58,7 @@ export async function expectationsAgent(ctx: RunContext, browserCtx: BrowserCont
   for (const crawled of pages) {
     const page = await browserCtx.newPage();
     try {
-      await page.goto(crawled.url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, crawled.url, AGENT);
       await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
       await scrollToBottom(page).catch(() => {}); // lazy content counts toward "does this page render anything"
 
@@ -126,29 +126,9 @@ export async function expectationsAgent(ctx: RunContext, browserCtx: BrowserCont
         } catch { /* control not clickable right now — skip, interaction agent covers dead controls */ }
       }
 
-      // Invariant 3 — a search box must react to a query (GET search is read-only).
-      if (f.hasSearchInput) {
-        try {
-          const box = page.locator("input[type='search'], input[name*='search' i], input[placeholder*='search' i]").first();
-          const beforeLen = raw.mainTextLen;
-          const beforeUrl = page.url();
-          await box.fill("test", { timeout: 3000 });
-          await box.press("Enter");
-          await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
-          await page.waitForTimeout(500);
-          const afterLen = await page.evaluate(() => ((document.querySelector("main, [role='main'], #content, .content") ?? document.body)?.textContent ?? "").replace(/\s+/g, " ").trim().length);
-          if (page.url() === beforeUrl && Math.abs(afterLen - beforeLen) < 20) {
-            ctx.finding({
-              agent: AGENT, severity: "medium", confidence: 0.7, role: role.name, pageUrl: crawled.url,
-              title: "Search does not respond to a query",
-              detail: `Typed "test" into the search box and pressed Enter — no navigation and no visible result change.`,
-              evidence: await ctx.screenshot(page, "search-dead"),
-            });
-          } else {
-            ctx.log(AGENT, "pass", `Search reacts to a query on ${url.pathname}`);
-          }
-        } catch { /* search box not interactable — skip */ }
-      }
+      // ponytail: search boxes are probed only by the interaction agent — two
+      // probes with different queries and different pass rules contradicted each
+      // other on the same box.
     } catch (e) {
       ctx.log(AGENT, "warn", `Check failed on ${crawled.url}: ${String(e).slice(0, 160)}`);
     } finally {

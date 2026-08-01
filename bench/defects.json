@@ -26,6 +26,24 @@
     { "id": "p4", "app": "spa", "path": "/contact", "dimension": "functional", "keyword": "empty", "severity": "high", "note": "contact route renders an empty main" },
     { "id": "p5", "app": "spa", "path": "", "dimension": "a11y", "keyword": "name", "severity": "medium", "note": "icon-only theme button has no accessible name" },
     { "id": "p6", "app": "spa", "path": "", "dimension": "a11y", "keyword": "label", "severity": "medium", "note": "quick-note form inputs have no labels" },
-    { "id": "p7", "app": "spa", "path": "", "dimension": "forms", "keyword": "", "severity": "medium", "note": "quick-note form accepts empty submit with no feedback" }
+    { "id": "p7", "app": "spa", "path": "", "dimension": "forms", "keyword": "", "severity": "medium", "note": "quick-note form accepts empty submit with no feedback" },
+
+    { "id": "u1", "app": "ui", "path": "", "dimension": "ui", "keyword": "overflow", "severity": "medium", "note": "1600px table forces horizontal overflow on every viewport" },
+    { "id": "u2", "app": "ui", "path": "", "dimension": "ui", "keyword": "clipped", "severity": "medium", "note": "fixed-width cells clip text with no ellipsis" },
+    { "id": "u3", "app": "ui", "path": "", "dimension": "ui", "keyword": "dead link", "severity": "low", "note": "nav has href='#' and javascript: placeholder links" },
+    { "id": "u4", "app": "ui", "path": "/settings", "dimension": "ui", "keyword": "inconsistent", "severity": "low", "note": "settings page uses an off-brand primary button colour" },
+    { "id": "u5", "app": "ui", "path": "", "dimension": "a11y", "keyword": "", "severity": "medium", "note": "icon-only gear button has no accessible name" },
+    { "id": "u6", "app": "ui", "path": "/billing", "dimension": "a11y", "keyword": "", "severity": "medium", "note": "card/exp/cvc inputs have no labels" },
+    { "id": "u7", "app": "ui", "path": "", "dimension": "a11y", "keyword": "contrast", "severity": "medium", "note": "#9a9a9a on white fails WCAG contrast" },
+    { "id": "u8", "app": "ui", "path": "/billing", "dimension": "ui", "keyword": "tap target", "severity": "medium", "note": "EXPECTED MISS: 16px tap target, far below guidance — no touch-target check exists" },
+    { "id": "u9", "app": "ui", "path": "/settings", "dimension": "ui", "keyword": "overlap", "severity": "medium", "note": "EXPECTED MISS: two absolutely positioned blocks overlap — no overlap assertion exists" },
+    { "id": "u10", "app": "ui", "path": "/billing", "dimension": "ui", "keyword": "hidden", "severity": "medium", "note": "EXPECTED MISS: price table display:none under 500px with no alternative — no per-breakpoint content check" },
+    { "id": "u11", "app": "ui", "path": "/billing", "dimension": "ui", "keyword": "broken image", "severity": "medium", "note": "card-brands.png 404s and renders broken" },
+    { "id": "u12", "app": "ui", "path": "/settings", "dimension": "ui", "keyword": "layout shift", "severity": "medium", "note": "trial banner injected 400ms after paint shifts the page (on /settings, so it does not mask the dead-button defect on /)" },
+    { "id": "u13", "app": "ui", "path": "/billing", "dimension": "ui", "keyword": "dismiss", "severity": "medium", "note": "EXPECTED MISS: cancel-subscription modal cannot be closed by keyboard, no focus trap — no dialog-behaviour check" },
+    { "id": "u14", "app": "ui", "path": "", "dimension": "functional", "keyword": "export", "severity": "medium", "note": "Export CSV button has no handler at all" },
+    { "id": "u15", "app": "ui", "path": "/reports", "dimension": "seo", "keyword": "title", "severity": "medium", "note": "/reports has no <title>" },
+    { "id": "u16", "app": "ui", "path": "/reports", "dimension": "seo", "keyword": "description", "severity": "low", "note": "/reports has no meta description" },
+    { "id": "u17", "app": "ui", "path": "/reports", "dimension": "ui", "keyword": "overflow", "severity": "medium", "note": "MOBILE-ONLY: 900px chart block overflows a phone viewport but not desktop — expected miss in quick (desktop-only) mode, catchable with BENCH_MODE=smart" }
   ]
 }

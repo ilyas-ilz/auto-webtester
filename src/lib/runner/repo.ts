@@ -210,7 +210,7 @@ export async function codeRootCause(ctx: RunContext, project: Project, findings:
         tool: HINT_TOOL,
         text: `A black-box QA run against ${project.baseUrl} found this issue:\n\nSeverity: ${f.severity}\nTitle: ${f.title}\nDetail: ${f.detail.slice(0, 800)}\nPage: ${f.pageUrl}\n\nThe candidate source files serving that route (line-numbered, truncated to ${SNIPPET_LINES} lines each):\n\n${snippets}\n\nIdentify the probable root cause in this code. If the shown code cannot plausibly cause the finding, report low confidence (<0.5) — do not guess.`,
       });
-      if (!res) return out; // no AI provider configured
+      if (!res) continue; // P2-11: one null response skips this finding, not the whole batch
       out.tokens += res.tokens;
       const h = res.input as { file?: unknown; line?: unknown; cause?: unknown; suggestedFix?: unknown; confidence?: unknown } | null;
       if (!h || typeof h.file !== "string" || typeof h.cause !== "string" || typeof h.confidence !== "number") continue;

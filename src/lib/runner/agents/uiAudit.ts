@@ -24,6 +24,33 @@ export function findOutliers(entries: { url: string; value: string | null }[]): 
 
 interface PageTokens { url: string; bodyFont: string | null; primaryBtn: string | null; h1size: string | null }
 
+/** WCAG 2.5.8 (AA) asks for at least 24×24 CSS px of pointer target. */
+export const MIN_TAP_PX = 24;
+
+/**
+ * Interactive elements whose hit area is below the guidance (bench u8). Pure so the
+ * threshold is testable without a browser. Elements smaller than 4px in either
+ * direction are treated as decorative/hidden rather than mis-sized taps.
+ */
+export function tooSmallTaps(targets: { sel: string; w: number; h: number }[], min = MIN_TAP_PX): { sel: string; w: number; h: number }[] {
+  return targets.filter((t) => t.w >= 4 && t.h >= 4 && (t.w < min || t.h < min));
+}
+
+/**
+ * Fraction of the SMALLER rect covered by the intersection. Two laid-out siblings
+ * should not cover each other; a ratio above the threshold means content is sitting
+ * on top of content (bench u9). Pure — selftested.
+ */
+export function overlapRatio(a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }): number {
+  const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+  const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const inter = ix * iy;
+  const smaller = Math.min(a.w * a.h, b.w * b.h);
+  return smaller <= 0 ? 0 : inter / smaller;
+}
+
+export const OVERLAP_THRESHOLD = 0.25;
+
 /**
  * UI agent — STATIC audit only (no clicking; clicking arbitrary controls on a
  * real app can mutate/destroy data). Per page: scrolls the whole page first to
@@ -43,7 +70,7 @@ export async function uiAuditAgent(ctx: RunContext, browserCtx: BrowserContext, 
   for (const url of urls) {
     const page = await browserCtx.newPage();
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, url, AGENT);
       await scrollToBottom(page).catch(() => {}); // trigger lazy content before measuring
 
       const audit = await page.evaluate(() => {
@@ -84,14 +111,79 @@ export async function uiAuditAgent(ctx: RunContext, browserCtx: BrowserContext, 
         }
         let primaryBtn: string | null = null, best = 0;
         for (const [c, n] of Object.entries(bg)) if (n > best) { best = n; primaryBtn = c; }
+        // Pointer targets (bench u8): every interactive element's rendered hit area.
+        const taps: { sel: string; w: number; h: number }[] = [];
+        for (const el of Array.from(document.querySelectorAll('a[href], button, input:not([type="hidden"]), select, textarea, [role="button"], [onclick]'))) {
+          const cs = getComputedStyle(el);
+          if (cs.display === "none" || cs.visibility === "hidden") continue;
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) continue;
+          const id = (el as HTMLElement).id ? `#${(el as HTMLElement).id}` : "";
+          const label = (el.textContent || "").trim().slice(0, 20);
+          taps.push({ sel: `${el.tagName.toLowerCase()}${id}${label ? ` "${label}"` : ""}`, w: Math.round(r.width), h: Math.round(r.height) });
+          if (taps.length >= 120) break;
+        }
+
+        // Overlapping siblings (bench u9): content covering content. Compared only
+        // within the same parent, and only for elements that actually carry text, so
+        // deliberate overlays (modals, dropdowns, sticky bars) are not blamed.
+        const boxes: { sel: string; x: number; y: number; w: number; h: number; parent: string }[] = [];
+        let pIdx = 0;
+        for (const parent of Array.from(document.querySelectorAll("body *")).slice(0, 400)) {
+          if (parent.childElementCount < 2) continue;
+          const pk = `p${pIdx++}`;
+          for (const el of Array.from(parent.children)) {
+            const cs = getComputedStyle(el);
+            if (cs.display === "none" || cs.visibility === "hidden" || cs.position === "fixed" || cs.position === "sticky") continue;
+            if (!(el.textContent || "").trim()) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 8 || r.height < 8) continue;
+            const id = (el as HTMLElement).id ? `#${(el as HTMLElement).id}` : "";
+            boxes.push({ sel: `${el.tagName.toLowerCase()}${id}`, x: r.left, y: r.top, w: r.width, h: r.height, parent: pk });
+          }
+        }
+
         const h1 = document.querySelector("h1");
         return {
-          deadLinks, overflow, clipped,
+          deadLinks, overflow, clipped, taps, boxes,
           bodyFont: getComputedStyle(document.body).fontFamily || null,
           primaryBtn,
           h1size: h1 ? getComputedStyle(h1).fontSize : null,
         };
       });
+
+      // Content that vanishes at a phone width (bench u10). Measured by narrowing the
+      // viewport on the SAME page — a per-breakpoint check a single-viewport audit
+      // cannot do, and the reason "works on desktop" hides mobile-only holes.
+      // Only reported on the primary (desktop) profile: a mobile profile is already
+      // narrow, so the comparison would be meaningless there.
+      let vanished: string[] = [];
+      if (!profileLabel) {
+        const original = page.viewportSize();
+        try {
+          const visibleText = () =>
+            page.evaluate(() => {
+              const out: string[] = [];
+              for (const el of Array.from(document.querySelectorAll("body *"))) {
+                if (el.childElementCount > 0) continue;
+                const t = (el.textContent || "").trim();
+                if (t.length < 8) continue;
+                const cs = getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                if (cs.display === "none" || cs.visibility === "hidden" || (r.width === 0 && r.height === 0)) continue;
+                out.push(t.slice(0, 60));
+              }
+              return out;
+            });
+          const wide = new Set(await visibleText());
+          await page.setViewportSize({ width: 390, height: 844 });
+          await page.waitForTimeout(250);
+          const narrow = new Set(await visibleText());
+          vanished = [...wide].filter((t) => !narrow.has(t)).slice(0, 6);
+        } catch { /* viewport change unsupported — skip the breakpoint check */ } finally {
+          if (original) await page.setViewportSize(original).catch(() => {});
+        }
+      }
 
       tokens.push({ url, bodyFont: audit.bodyFont, primaryBtn: audit.primaryBtn, h1size: audit.h1size });
 
@@ -113,6 +205,40 @@ export async function uiAuditAgent(ctx: RunContext, browserCtx: BrowserContext, 
         ctx.finding({ agent: AGENT, severity: "medium", role: role.name, pageUrl: url,
           title: tag(`${audit.clipped.length} element(s) with clipped/overflowing text`),
           detail: `Text is cut off or spilling out of its container (e.g. a card too small for its content):\n${samples}`, evidence: shot });
+      }
+
+      // Pointer targets too small to hit reliably on a touch screen.
+      const smallTaps = tooSmallTaps(audit.taps);
+      if (smallTaps.length > 0) {
+        ctx.finding({ agent: AGENT, severity: "medium", role: role.name, pageUrl: url,
+          title: tag(`${smallTaps.length} tap target(s) smaller than ${MIN_TAP_PX}px`),
+          detail: `WCAG 2.5.8 (AA) asks for at least ${MIN_TAP_PX}×${MIN_TAP_PX} CSS px of pointer target. These are smaller, so they are hard to hit on a phone:\n${smallTaps.slice(0, 8).map((t) => `• ${t.sel} — ${t.w}×${t.h}px`).join("\n")}`,
+          evidence: shot, owasp: [] });
+      }
+
+      // Content sitting on top of content.
+      const overlaps: string[] = [];
+      for (let i = 0; i < audit.boxes.length && overlaps.length < 6; i++) {
+        for (let j = i + 1; j < audit.boxes.length && overlaps.length < 6; j++) {
+          const a = audit.boxes[i], b = audit.boxes[j];
+          if (a.parent !== b.parent) continue;
+          const ratio = overlapRatio(a, b);
+          if (ratio > OVERLAP_THRESHOLD) overlaps.push(`• ${a.sel} and ${b.sel} overlap by ${Math.round(ratio * 100)}% of the smaller element`);
+        }
+      }
+      if (overlaps.length > 0) {
+        ctx.finding({ agent: AGENT, severity: "medium", role: role.name, pageUrl: url,
+          title: tag(`${overlaps.length} pair(s) of overlapping elements`),
+          detail: `Sibling elements are covering each other, so some content is unreadable or unclickable:\n${overlaps.join("\n")}`,
+          evidence: shot });
+      }
+
+      // Content present on desktop and gone at phone width.
+      if (vanished.length > 0) {
+        ctx.finding({ agent: AGENT, severity: "medium", role: role.name, pageUrl: url,
+          title: tag(`${vanished.length} block(s) of content hidden at 390px width`),
+          detail: `This content is visible on desktop but disappears on a phone-width viewport, with no alternative shown — mobile users cannot reach it:\n${vanished.map((t) => `• "${t}"`).join("\n")}`,
+          evidence: shot });
       }
     } catch (e) {
       ctx.log(AGENT, "warn", `ui-audit failed on ${url}: ${String(e).slice(0, 160)}`);

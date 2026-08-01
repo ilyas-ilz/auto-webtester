@@ -3,9 +3,10 @@
 import { redirect } from "next/navigation";
 import { nanoid } from "nanoid";
 import { z } from "zod";
-import { createProject as dbCreateProject, deleteProject as dbDeleteProject, getProject } from "@/lib/db";
+import { revalidatePath } from "next/cache";
+import { createProject as dbCreateProject, deleteProject as dbDeleteProject, getProject, getRun, requestCancel, deleteRun as dbDeleteRun, hasActiveRun, listRuns } from "@/lib/db";
 import { startRun } from "@/lib/runner/orchestrate";
-import type { Project, RunMode } from "@/lib/types";
+import type { Project } from "@/lib/types";
 
 const roleSchema = z.object({
   id: z.string().min(1),
@@ -24,7 +25,8 @@ const journeySchema = z.object({
 
 const projectSchema = z.object({
   name: z.string().min(1, "Project name is required"),
-  baseUrl: z.string().refine((v) => { try { new URL(v); return true; } catch { return false; } }, "Enter a full URL, e.g. https://app.example.com"),
+  // P2-1 (WEBTESTER-AUDIT): only http/https — `new URL` alone accepts file:, javascript:, etc.
+  baseUrl: z.string().refine((v) => { try { return ["http:", "https:"].includes(new URL(v).protocol); } catch { return false; } }, "Enter a full http(s) URL, e.g. https://app.example.com"),
   envTag: z.enum(["localhost", "staging", "production"]),
   loginPath: z.string().min(1),
   registerPath: z.string(),
@@ -85,19 +87,71 @@ export async function createProjectAction(_prev: FormState, formData: FormData):
 
   const project: Project = { id: nanoid(), createdAt: new Date().toISOString(), ...parsed.data };
   dbCreateProject(project);
+  revalidatePath("/");
   redirect(`/projects/${project.id}`);
 }
 
 export async function deleteProjectAction(id: string): Promise<void> {
+  // P0-4 (WEBTESTER-AUDIT): never delete a project out from under an executing run —
+  // the runner would keep inserting events/findings against vanished rows.
+  if (hasActiveRun(id)) redirect(`/projects/${id}?error=active-run`);
   dbDeleteProject(id);
+  revalidatePath("/");
   redirect("/");
+}
+
+/** Stop button: flags the run; the runner unwinds at its next agent boundary. */
+export async function stopRunAction(runId: string): Promise<void> {
+  const run = getRun(runId);
+  if (!run) return;
+  requestCancel(runId);
+  revalidatePath(`/projects/${run.projectId}/runs/${runId}`);
+}
+
+/** Delete a run and everything it produced. Stops it first if it's still going. */
+export async function deleteRunAction(runId: string): Promise<void> {
+  const run = getRun(runId);
+  if (!run) return;
+  if (run.status === "running" || run.status === "queued") {
+    // Flag + let the loop unwind, rather than deleting rows an active run still writes to.
+    requestCancel(runId);
+    for (let i = 0; i < 30 && (getRun(runId)?.status === "running" || getRun(runId)?.status === "queued"); i++) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    // P0-4 (WEBTESTER-AUDIT): if it STILL hasn't stopped, refuse to delete — deleting
+    // rows an active runner writes to corrupts history. The cancel flag stays set;
+    // the user can delete once the run reaches a terminal state.
+    const s = getRun(runId)?.status;
+    if (s === "running" || s === "queued") redirect(`/projects/${run.projectId}/runs/${runId}?error=still-stopping`);
+  }
+  dbDeleteRun(runId);
+  revalidatePath("/");
+  revalidatePath(`/projects/${run.projectId}`);
+  redirect(`/projects/${run.projectId}`);
+}
+
+/** Retry an interrupted run: same project + mode, resuming where that one stopped. */
+export async function retryRunAction(runId: string): Promise<void> {
+  const run = getRun(runId);
+  if (!run) return;
+  const project = getProject(run.projectId);
+  if (!project) return;
+  const active = listRuns(run.projectId).find((r) => r.status === "running" || r.status === "queued");
+  if (active) redirect(`/projects/${run.projectId}/runs/${active.id}`);
+  const newId = startRun(project, run.mode, runId);
+  redirect(`/projects/${run.projectId}/runs/${newId}`);
 }
 
 export async function startRunAction(formData: FormData): Promise<void> {
   const projectId = String(formData.get("projectId") ?? "");
-  const mode = (String(formData.get("mode") ?? "quick") as RunMode);
+  // P2-1 (WEBTESTER-AUDIT): parse, don't cast — an unknown mode falls back to quick.
+  const mode = z.enum(["quick", "smart", "full"]).catch("quick").parse(formData.get("mode"));
   const project = getProject(projectId);
   if (!project) return;
+  // P1-2: one run per project — jump to the already-active run instead of stacking a second.
+  const active = listRuns(projectId).find((r) => r.status === "running" || r.status === "queued");
+  if (active) redirect(`/projects/${projectId}/runs/${active.id}`);
   const runId = startRun(project, mode);
+  revalidatePath("/");
   redirect(`/projects/${projectId}/runs/${runId}`);
 }

@@ -9,6 +9,13 @@ const MAX_PAGES = 40;
 const MAX_PER_TEMPLATE = 3; // /surah/2 and /surah/3 are the same template — test a few, not all 114
 const MAX_PER_PARENT = 8; // slug children (/surah/al-fatiha …) collapse under their parent dir
 const MAX_API_SAMPLES = 60; // cap on captured JSON response bodies (R4) — bounds memory on chatty SPAs
+const MAX_COLLAPSED_PROBES = 150; // HEAD-probe budget for template-collapsed siblings
+
+function chunk<T>(arr: T[], n: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
 
 // Known analytics/telemetry beacon hosts (Plan-v5 R7). A request to any of these
 // means the provider fired; the analytics agent reports what it saw. Pure host
@@ -171,6 +178,7 @@ export async function crawlAgent(
   const templateCount = new Map<string, number>();
   const parentCount = new Map<string, number>();
   let collapsed = 0;
+  const collapsedUrls = new Set<string>(); // still HEAD-probed for broken links — a 404 sibling is exactly when collapsing is wrong
   await browserCtx.addInitScript(SPA_CAPTURE);
 
   // Sitemap seeding: know the whole inventory before the first click.
@@ -185,6 +193,7 @@ export async function crawlAgent(
   }
 
   while (queue.length && seen.size < MAX_PAGES) {
+    ctx.checkCancelled(); // P1-3: a 40-page crawl must stop mid-loop, not at the next agent boundary
     const norm = queue.shift()!.split("#")[0];
     if (seen.has(norm)) continue;
 
@@ -194,6 +203,7 @@ export async function crawlAgent(
     const parent = parentDir(norm);
     if ((templateCount.get(tpl) ?? 0) >= MAX_PER_TEMPLATE || (parent && (parentCount.get(parent) ?? 0) >= MAX_PER_PARENT)) {
       collapsed++;
+      if (collapsedUrls.size < MAX_COLLAPSED_PROBES) collapsedUrls.add(norm);
       continue;
     }
     templateCount.set(tpl, (templateCount.get(tpl) ?? 0) + 1);
@@ -246,8 +256,12 @@ export async function crawlAgent(
 
     const title = await page.title().catch(() => "");
     ctx.status(AGENT, `Crawling ${norm} as ${role.name}`, { url: norm });
-    // route-health checks every crawled page with zero re-navigation (V4 coverage matrix).
-    ctx.recordTested(norm, "route-health");
+    // A-1 (WEBTESTER-AUDIT): coverage is recorded for THIS agent only, and only now
+    // that the page was actually opened. It used to stamp "route-health" here, before
+    // that agent had run at all — so the matrix claimed a dimension was covered even
+    // when route-health later failed or never ran (the same defect P0-2 fixed in
+    // sampleFor). route-health records its own coverage when it examines the page.
+    if (status !== null) ctx.recordTested(norm, AGENT);
     const shot = seen.size <= 30 ? await ctx.screenshot(page, `${role.name}-${title || "page"}`, { role: role.name }) : null;
     ctx.pages.push({ url: norm, title, role: role.name, status, consoleErrors, failedRequests, screenshot: shot });
     ctx.log(AGENT, "step", `Crawled ${norm} (${status ?? "?"}) — "${title}"`);
@@ -272,5 +286,28 @@ export async function crawlAgent(
 
   for (const call of ctx.apiCalls) recordApiNode(project.id, ctx.runId, call.method, call.url, call.status);
   if (collapsed) ctx.log(AGENT, "step", `Collapsed ${collapsed} sibling URL(s) into already-sampled templates (${templateCount.size} distinct page types)`);
+
+  // Collapsed siblings are never rendered, but a broken link among "similar" URLs is
+  // exactly the case sampling must not hide (bench c4: index links /article/9 → 404).
+  // Cheap HEAD probe each; only failures become page entries for route-health.
+  if (collapsedUrls.size) {
+    let broken = 0;
+    for (const batch of chunk([...collapsedUrls], 8)) {
+      ctx.checkCancelled();
+      await Promise.all(batch.map(async (u) => {
+        let status: number | null = null;
+        try {
+          const r = await browserCtx.request.head(u, { timeout: 10000 });
+          status = r.status();
+          if (status === 405) status = (await browserCtx.request.get(u, { timeout: 10000 })).status();
+        } catch { /* unreachable — status stays null, reported as failed request below */ }
+        if (status !== null && status >= 400) {
+          broken++;
+          ctx.pages.push({ url: u, title: "", role: role.name, status, consoleErrors: [], failedRequests: [], screenshot: null, probed: true });
+        }
+      }));
+    }
+    ctx.log(AGENT, "step", `Probed ${collapsedUrls.size} collapsed sibling URL(s) with HEAD — ${broken} broken (>=400)`);
+  }
   ctx.log(AGENT, "pass", `Discovered ${ctx.pages.filter((p) => p.role === role.name).length} pages for ${role.name}`);
 }

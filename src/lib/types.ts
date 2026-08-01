@@ -48,7 +48,21 @@ export interface Journey {
 
 export type RunMode = "quick" | "smart" | "full";
 
-export type RunStatus = "queued" | "running" | "passed" | "failed" | "error";
+// "inconclusive" (P0-2): the run finished but a required agent failed or evidence
+// is incomplete — neither an honest PASS nor a product-defect FAIL.
+export type RunStatus = "queued" | "running" | "passed" | "failed" | "inconclusive" | "error" | "cancelled";
+
+// A question an agent raised mid-run for the human watching the live view
+// (e.g. login rejected — supply a corrected password or say "skip").
+export interface RunQuestion {
+  id: number;
+  runId: string;
+  agent: string;
+  question: string;
+  answer: string | null;
+  status: "pending" | "answered" | "expired";
+  createdAt: string;
+}
 
 export interface Run {
   id: string;
@@ -62,6 +76,7 @@ export interface Run {
   reportJson: string | null; // serialized RunReport, filled when the run finishes
   missionAgents: string[]; // the Mission Planner's full agent list, known before the run starts — feeds the live timeline's queued state (V3)
   commitSha: string | null; // target repo's HEAD at run time (V8) — null when no repoPath / not a git repo
+  humanTakeoverAt: string | null; // when a human first took the live view's wheel — null means the run is pure agent evidence
 }
 
 // ---- Structured run report (Plan-v3 Fix C) ----
@@ -87,8 +102,33 @@ export interface RunReport {
   coverageMatrix?: CoverageMatrix; // route × dimension coverage, with explicit "not tested" (V4)
   lighthouse?: LighthouseResult[]; // one entry per audited representative page (V5)
   rootCauseHints?: RootCauseHint[]; // AI-located probable source of the worst findings (V7) — only when repoPath is set
+  rootCauses?: RootCauseCluster[]; // shared-cause clusters (P7), persisted so the report can fold each cluster's member findings under it instead of listing both
   regressionFocus?: RegressionFocus; // routes prioritized because their files changed in git since the last run (V8)
   arr?: AutonomousResolution; // how many unknown effects got resolved deterministically vs needing AI (Plan-v7 §6)
+  owaspCoverage?: OwaspCoverageRow[]; // OWASP Top 10 2021 tested/findings matrix (Plan-v8 §6.4) — omitted "not tested" categories are still listed, never invented as covered
+  crossModelVerifications?: CrossModelVerdict[]; // second-opinion verdicts on expensive AI findings (Plan-v8 §4.2) — empty/omitted when AI_VERIFY_MODEL is unset
+  missionReason?: string; // mission.reason (PLAN-REPORT-TRUST §3) — why this scope, for the "how this was tested" narrative
+  sampleSize?: number; // mission.sampleSize (PLAN-REPORT-TRUST §3) — the per-role page cap, so the narrative can name what it excluded
+  agentsFailed?: { name: string; reason: string }[]; // agents that exhausted retries (P0-2) — tester infrastructure failures, displayed apart from product defects
+  executionOutcome?: "completed" | "partial"; // partial = at least one scheduled agent failed — the run's evidence is incomplete (P0-2)
+  statusReason?: string; // one line explaining WHY the run got its status (verdict policy P1-12)
+}
+
+/** A second model's adversarial verdict on one AI-sourced finding (Plan-v8 §4.2). */
+export interface CrossModelVerdict {
+  fingerprint: string;
+  verdict: "confirmed" | "refuted" | "uncertain";
+  reason: string;
+}
+
+/** One OWASP Top 10 2021 category's coverage row (Plan-v8 §6.4). `tested: null` means
+ * honestly not tested (§6.6) — never rendered as a fake zero. */
+export interface OwaspCoverageRow {
+  category: string; // e.g. "A01:2021"
+  label: string; // e.g. "Broken Access Control"
+  tested: number | null;
+  findings: number;
+  notTestedReason?: string;
 }
 
 /** Autonomous Resolution Rate (Plan-v7 §6) — unknowns resolved without AI ÷ unknowns encountered. */
@@ -203,6 +243,9 @@ export interface Finding {
   role: string | null;
   evidence: string | null; // screenshot path or raw data JSON
   fingerprint: string;
+  fingerprintV: number; // fingerprint normalization schema version (Plan-v8 §3.2) — regression.ts skips a diff across versions instead of reporting every pre-existing finding as spuriously new
+  afterHuman: boolean; // recorded after a human drove the live view — the page state is no longer purely the app's doing
+  owasp?: string[]; // OWASP Top 10 2021 category tags (Plan-v8 §6.1), e.g. ["A01:2021"] — one finding can map to several; omitted/[] = unmapped
 }
 
 // ---- Knowledge graph (Plan-v2 §3.3) ----
@@ -268,4 +311,5 @@ export interface Mission {
   profiles: string[]; // device/browser profile names (see runner/devices.ts) — [0] is always the primary
   aiTokenBudget: number; // cost guardrail (§5.1 budget.aiTokens) — 0 when useAI is false
   reason: string;
+  experienceNote?: string; // compact "known from N previous runs" block (Plan-v8 §1.3) — fed into AI-reviewer's prompt
 }

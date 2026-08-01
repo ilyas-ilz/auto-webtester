@@ -43,7 +43,7 @@ export async function chaosAgent(ctx: RunContext, browserCtx: BrowserContext, ro
     page.on("pageerror", () => { hadError = true; });
     page.on("dialog", (d) => void d.dismiss().catch(() => {}));
     try {
-      await page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, target.url, AGENT);
 
       for (const cond of CHAOS_CONDITIONS) {
         await applyCondition(page, cond);

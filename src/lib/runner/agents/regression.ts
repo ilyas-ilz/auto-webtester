@@ -1,5 +1,5 @@
 import { RunContext } from "../context";
-import { listFindings, previousRunFindings, findingHistory } from "../../db";
+import { listFindings, previousRunFindings, findingHistory, CURRENT_FINGERPRINT_VERSION } from "../../db";
 import type { Project, Finding } from "../../types";
 
 const AGENT = "regression";
@@ -31,7 +31,15 @@ export function regressionAgent(ctx: RunContext, project: Project): void {
   // ever-changing counts would churn as new/resolved on every subsequent run.
   const real = (f: Finding) => f.agent !== AGENT;
   const current = listFindings(ctx.runId).filter(real);
-  const { isNew, resolved } = diffByFingerprint(prev.findings.filter(real), current);
+  const prevReal = prev.findings.filter(real);
+  // Plan-v8 §3.2: a fingerprint-normalization change makes every pre-existing
+  // fingerprint unrecognizable to the new hash — diffing across that boundary would
+  // report every old finding as spuriously "new". Skip the diff for this one run
+  // instead (an unexplainable regression report is worse than a quiet one-run gap);
+  // next run compares normally since both sides will carry the current version.
+  const versionChanged = prevReal.some((f) => f.fingerprintV !== CURRENT_FINGERPRINT_VERSION);
+  if (versionChanged) ctx.log(AGENT, "step", "Fingerprint scheme changed since the last run — skipping this run's new/resolved diff.");
+  const { isNew, resolved } = versionChanged ? { isNew: [] as Finding[], resolved: [] as Finding[] } : diffByFingerprint(prevReal, current);
 
   ctx.log(AGENT, "pass", `vs last run: ${isNew.length} new, ${resolved.length} resolved`);
   if (isNew.length) {

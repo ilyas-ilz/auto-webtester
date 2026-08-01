@@ -49,11 +49,15 @@ export async function permissionsAgent(ctx: RunContext, sessions: RoleSession[])
           const blocked = status >= 400 || finalPath !== new URL(target.url).pathname || DENIED_TEXT.test(bodyText);
           if (!blocked) {
             const shot = await ctx.screenshot(page, `${b.role.name}-reached-${a.role.name}-route`);
+            // P1-13 (WEBTESTER-AUDIT): "A found this route, B didn't" is a discovery
+            // difference, not an authorization specification — B may be perfectly
+            // entitled to the page and simply never linked to it. Reported as HIGH
+            // needing review, not CRITICAL fact, and never with confidence 1.0.
             ctx.finding({
-              agent: AGENT, severity: "critical", role: b.role.name, pageUrl: target.url,
-              title: `Role "${b.role.name}" can reach "${a.role.name}"'s route ${finalPath}`,
-              detail: `${b.role.name}'s session loaded ${target.url} (HTTP ${status}) without being redirected or denied, but only ${a.role.name} discovered this route during crawl.`,
-              evidence: shot,
+              agent: AGENT, severity: "high", kind: "bug", confidence: 0.5, role: b.role.name, pageUrl: target.url,
+              title: `Role "${b.role.name}" can reach "${a.role.name}"'s route ${finalPath} — verify this is intended`,
+              detail: `${b.role.name}'s session loaded ${target.url} (HTTP ${status}) without being redirected or denied. Only ${a.role.name} discovered this route during crawl, which is a DISCOVERY difference, not a documented permission rule — ${b.role.name} may legitimately be allowed here. Confirm against the intended role matrix before treating this as a real access-control gap.`,
+              evidence: shot, owasp: ["A01:2021"],
             });
           }
         } catch (e) {
@@ -180,7 +184,7 @@ export async function writeIdorReplay(ctx: RunContext, sessions: RoleSession[]):
             agent: AGENT, severity: "critical", kind: "bug", role: b.role.name, pageUrl: w.url,
             title: `Role "${b.role.name}" can write "${w.ownerRole}"'s data via ${w.method} ${path}`,
             detail: `${b.role.name}'s session re-issued a ${w.method} that ${w.ownerRole} used on its own record and got HTTP ${status} (owner baseline ${w.ownerStatus}). A cross-role write succeeded where it should have been denied — write-IDOR / broken object-level authorization. Confirmed against a disposable qabot- entity (${w.tag}); verify by hand before treating as production impact.`,
-            evidence: JSON.stringify({ method: w.method, url: w.url, ownerRole: w.ownerRole, ownerStatus: w.ownerStatus, crossRole: b.role.name, crossRoleStatus: status }),
+            evidence: JSON.stringify({ method: w.method, url: w.url, ownerRole: w.ownerRole, ownerStatus: w.ownerStatus, crossRole: b.role.name, crossRoleStatus: status }), owasp: ["A01:2021"],
           });
         } else {
           ctx.log(AGENT, verdict === "protected" ? "pass" : "warn", `${b.role.name} ${w.method} ${path} → HTTP ${status} (${verdict})`);
@@ -202,16 +206,20 @@ export async function writeIdorReplay(ctx: RunContext, sessions: RoleSession[]):
 // role×route matrix misses. Ownership/tenancy is read off the §3.3 graph
 // (created_by / belongs_to edges); this is the pure verdict layer over it.
 
-export type Relationship = "owner" | "same-tenant" | "other-tenant";
+// "unknown" (WEBTESTER-AUDIT P1-13): tenancy that was never learned is NOT evidence
+// of separate tenancy. Two roles legitimately sharing a tenant would otherwise be
+// reported as a critical cross-tenant leak.
+export type Relationship = "owner" | "same-tenant" | "other-tenant" | "unknown";
 
 /**
  * Resolve the actor's relationship to a resource from ownership + tenancy facts
  * (as recorded on the graph). Owner beats tenant match beats everything-else.
+ * Missing tenancy facts on either side → "unknown", never "other-tenant" (P1-13).
  */
 export function relationshipOf(actorIsOwner: boolean, actorTenant: string | null, resourceTenant: string | null): Relationship {
   if (actorIsOwner) return "owner";
-  if (actorTenant && resourceTenant && actorTenant === resourceTenant) return "same-tenant";
-  return "other-tenant";
+  if (!actorTenant || !resourceTenant) return "unknown";
+  return actorTenant === resourceTenant ? "same-tenant" : "other-tenant";
 }
 
 /**
@@ -219,6 +227,7 @@ export function relationshipOf(actorIsOwner: boolean, actorTenant: string | null
  *  - owner + 2xx        → protected (the owner is SUPPOSED to succeed)
  *  - other-tenant + 2xx → vulnerable (cross-tenant access/mutation — the worst case)
  *  - same-tenant + 2xx  → inconclusive (may be legitimate intra-org sharing)
+ *  - unknown + 2xx      → inconclusive (P1-13: unlearned tenancy is not proof of separate tenancy)
  *  - 404                → protected (resource hidden from this actor)
  *  - 401/403            → §8.1: only "protected" when identity was isolated, else inconclusive
  *  - anything else      → inconclusive
@@ -259,14 +268,29 @@ export async function relAuthzReplay(ctx: RunContext, sessions: RoleSession[]): 
       ctx.status(AGENT, `Reading ${w.ownerRole}'s object ${path} as ${b.role.name}`, { url: w.url });
       try {
         const resp = await b.browserCtx.request.get(w.url);
-        const rel = relationshipOf(false, null, null); // non-owner; tenancy unknown → conservative other-tenant
+        // P1-13: HTTP 200 alone is not exposure. Tenancy is unlearned, so the
+        // relationship is "unknown" → inconclusive by policy; what upgrades this to a
+        // real finding is the OTHER role's response actually containing the owner's
+        // tagged data (proven exposure, not an inferred authorization spec).
+        const rel = relationshipOf(false, null, null); // non-owner; tenancy unknown
         const verdict = classifyRelAuthz(rel, resp.status(), true); // GET → identity isolated
-        if (verdict === "vulnerable") {
+        const ok2xx = resp.status() >= 200 && resp.status() < 300;
+        const body = ok2xx ? (await resp.text().catch(() => "")).slice(0, 20000) : "";
+        const leaked = !!w.tag && body.includes(w.tag);
+        if (leaked) {
           ctx.finding({
             agent: AGENT, severity: "critical", kind: "bug", role: b.role.name, pageUrl: w.url,
             title: `Role "${b.role.name}" can read "${w.ownerRole}"'s object via GET ${path}`,
-            detail: `${b.role.name}'s session GET ${w.url} → HTTP ${resp.status()} on an object only ${w.ownerRole} created this run — cross-role read / object-level IDOR. Confirmed against a disposable qabot- entity (${w.tag}); verify by hand before treating as production impact.`,
-            evidence: JSON.stringify({ method: "GET", url: w.url, ownerRole: w.ownerRole, crossRole: b.role.name, crossRoleStatus: resp.status() }),
+            detail: `${b.role.name}'s session GET ${w.url} → HTTP ${resp.status()} AND the response body contained ${w.ownerRole}'s own tagged value (${w.tag}) — proven cross-role data exposure, not just a permissive status code. Confirmed against a disposable qabot- entity; verify by hand before treating as production impact.`,
+            evidence: JSON.stringify({ method: "GET", url: w.url, ownerRole: w.ownerRole, crossRole: b.role.name, crossRoleStatus: resp.status(), tagFoundInBody: true }), owasp: ["A01:2021"],
+          });
+        } else if (ok2xx) {
+          // Reachable but nothing of the owner's data proven in the body: a lead, not a verdict.
+          ctx.finding({
+            agent: AGENT, severity: "medium", kind: "bug", confidence: 0.4, role: b.role.name, pageUrl: w.url,
+            title: `Role "${b.role.name}" gets HTTP ${resp.status()} on "${w.ownerRole}"'s object ${path} — needs review`,
+            detail: `The request succeeded but the response did not contain ${w.ownerRole}'s tagged value, and this project has no learned tenancy facts — so this is NOT confirmed cross-tenant access. It may be legitimate shared access, an empty/placeholder response, or a real leak of untagged fields. Verify by hand.`,
+            evidence: JSON.stringify({ method: "GET", url: w.url, ownerRole: w.ownerRole, crossRole: b.role.name, crossRoleStatus: resp.status(), tagFoundInBody: false, relationship: rel }), owasp: ["A01:2021"],
           });
         } else {
           ctx.log(AGENT, verdict === "protected" ? "pass" : "warn", `${b.role.name} GET ${path} → HTTP ${resp.status()} (${verdict})`);

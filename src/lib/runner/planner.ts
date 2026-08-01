@@ -1,6 +1,8 @@
 import type { Project, RunMode, Mission } from "../types";
 import { profilesForMode } from "./devices";
 import { aiAvailable, aiProviderLabel } from "./ai";
+import { summarizeForPrompt } from "./experience";
+import type { ExperienceRow } from "../db";
 
 const SAMPLE_BY_MODE: Record<RunMode, number> = { quick: 3, smart: 6, full: 12 };
 // Cost guardrail (§5.1 budget.aiTokens) — a ceiling, not an expected-usage number.
@@ -17,7 +19,7 @@ const DETERMINISTIC_AGENTS = ["login", "crawler", "site-classifier", "route-heal
  * planner (prompt → scoped subset of the graph) is real Plan-v2 scope but is
  * deferred — this ships Phase 1's explicit "heuristic fallback" first.
  */
-export function planMission(project: Project, mode: RunMode): Mission {
+export function planMission(project: Project, mode: RunMode, experience: readonly ExperienceRow[] = []): Mission {
   const agents = [...DETERMINISTIC_AGENTS];
   if (project.roles.length > 1) agents.push("permissions");
   if (project.registerPath) agents.push("register");
@@ -41,5 +43,8 @@ export function planMission(project: Project, mode: RunMode): Mission {
   if (project.roles.length > 1) reasons.push(`${project.roles.length} roles → permission matrix enabled`);
   reasons.push(useAI ? `AI layer enabled via ${aiProviderLabel()} (budget ${aiTokenBudget.toLocaleString()} tokens)` : mode === "quick" ? "AI layer off (quick mode)" : "AI layer off (no ANTHROPIC_API_KEY / OPENROUTER_API_KEY)");
 
-  return { agents, useAI, sampleSize: SAMPLE_BY_MODE[mode], profiles, aiTokenBudget, reason: reasons.join("; ") };
+  const experienceNote = summarizeForPrompt(experience) ?? undefined;
+  if (experienceNote) reasons.push(`recalled experience from ${experience.length} row(s) learned in previous runs`);
+
+  return { agents, useAI, sampleSize: SAMPLE_BY_MODE[mode], profiles, aiTokenBudget, reason: reasons.join("; "), experienceNote };
 }

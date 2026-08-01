@@ -1,17 +1,20 @@
-// One-off e2e verifier — creates the mployedin project with all 5 roles, runs a
-// smart-mode pass, then prints per-agent activity so we can see each agent did
-// real work (steps + findings), not "just a screenshot". Delete after use.
+// e2e verifier — creates the mployedin project with all 5 roles, runs the fleet,
+// then prints per-agent activity so we can see each agent did real work (steps +
+// findings), not "just a screenshot". Since Plan-v8 it also reports what the
+// experience store recalled/learned, so a second run visibly differs from the first.
+// Mode via RUN_MODE (default full); stable project id so runs accumulate history.
 import { loadEnvLocal } from "./env";
 loadEnvLocal(); // tsx doesn't load .env.local — without this the AI layer is silently off
 import { nanoid } from "nanoid";
-import type { Project, RoleCred } from "../types";
-import { createProject, listEvents, listFindings } from "../db";
+import type { Project, RoleCred, RunMode } from "../types";
+import { createProject, getProject, listEvents, listFindings } from "../db";
 import { runProject } from "./orchestrate";
+import { loadExperience } from "./experience";
 
 const mk = (name: string, username: string, password: string): RoleCred => ({ id: nanoid(), name, username, password });
 
 const project: Project = {
-  id: nanoid(),
+  id: "mployedin",
   name: "mployedin",
   baseUrl: "https://mployedin-app-jr8h5.ondigitalocean.app",
   envTag: "staging",
@@ -35,9 +38,12 @@ const project: Project = {
 };
 
 async function main(): Promise<void> {
-  createProject(project);
-  console.log(`\n▶ mployedin smart run starting (${project.roles.length} roles)...\n`);
-  const runId = await runProject(project, "full");
+  const mode = (process.env.RUN_MODE as RunMode) || "full";
+  if (!getProject(project.id)) createProject(project);
+  const origin = new URL(project.baseUrl).origin;
+  const before = loadExperience(origin);
+  console.log(`\n▶ mployedin ${mode} run starting (${project.roles.length} roles) — ${before.length} experience row(s) from previous runs\n`);
+  const runId = await runProject(project, mode);
 
   const events = listEvents(runId);
   const findings = listFindings(runId);
@@ -65,7 +71,13 @@ async function main(): Promise<void> {
     console.log(`  ${e.level.padEnd(5)} ${e.message.slice(0, 110)}`);
   }
 
-  console.log(`\nRun ${runId} complete. DB: data/webtester.db\n`);
+  // Plan-v8 §1: what this run left behind for the next one.
+  const after = loadExperience(origin);
+  console.log(`\n${"═".repeat(72)}\nEXPERIENCE (Plan-v8 §1) — ${before.length} recalled → ${after.length} stored\n${"═".repeat(72)}`);
+  for (const r of after.slice(0, 15)) console.log(`  ${r.kind.padEnd(9)} ${r.scope.padEnd(6)} runs=${String(r.runCount).padStart(2)} conf=${r.confidence.toFixed(2)} ${`${r.subject} ${r.predicate} ${r.object}`.slice(0, 90)}`);
+  if (after.length > 15) console.log(`  … ${after.length - 15} more`);
+
+  console.log(`\nRun ${runId} complete. DB: data/webtester.db · report: data/reports/${runId}.md\n`);
   process.exit(0);
 }
 

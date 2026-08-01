@@ -106,33 +106,55 @@ export async function pageDigest(page: Page, cap: number = DIGEST_CAP): Promise<
   return buildDigest(raw, cap);
 }
 
-export async function execute(page: Page, a: NavAction, tag: string, persona?: Journey["persona"]): Promise<boolean> {
+// P0-3 (WEBTESTER-AUDIT): action errors are no longer swallowed into "true" —
+// a failed goto/press/fill/select/click returns false, so the transcript and the
+// Navigator both see that the action did not apply.
+export async function execute(page: Page, a: NavAction, tag: string, persona?: Journey["persona"], allowedOrigin?: string): Promise<boolean> {
   const value = a.value ? expandTokens(a.value, tag) : "";
-  if (a.action === "goto" && a.target) { await page.goto(a.target, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {}); return true; }
-  if (a.action === "press" && value) { await page.keyboard.press(value).catch(() => {}); return true; }
+  if (a.action === "goto" && a.target) {
+    // Never let the AI navigate the journey off the configured target (P0-3 fix #2).
+    try { if (allowedOrigin && new URL(a.target, allowedOrigin).origin !== allowedOrigin) return false; } catch { return false; }
+    return page.goto(a.target, { waitUntil: "domcontentloaded", timeout: 20000 }).then(() => true).catch(() => false);
+  }
+  if (a.action === "press" && value) return page.keyboard.press(value).then(() => true).catch(() => false);
   if (!a.target) return false;
   if (UNSAFE.test(a.target)) return false; // safety: never click logout/delete/api targets
 
   const loc = await firstVisible(candidates(page, a.target));
   if (!loc) return false;
+  let applied: boolean;
   if (a.action === "fill") {
-    await loc.fill(value).catch(() => {});
+    applied = await loc.fill(value).then(() => true).catch(() => false);
   } else if (a.action === "select") {
-    await loc.selectOption({ label: value }).catch(() => loc.selectOption({ index: 1 }).catch(() => {}));
+    applied = await loc.selectOption({ label: value }).then(() => true).catch(() => loc.selectOption({ index: 1 }).then(() => true).catch(() => false));
+  } else if (persona === "keyboard-only") {
+    applied = await loc.focus().then(() => true).catch(() => false);
+    if (applied) applied = await page.keyboard.press("Enter").then(() => true).catch(() => false);
   } else {
-    if (persona === "keyboard-only") { await loc.focus().catch(() => {}); await page.keyboard.press("Enter").catch(() => {}); }
-    else await loc.click({ timeout: 5000 }).catch(() => {});
+    applied = await loc.click({ timeout: 5000 }).then(() => true).catch(() => false);
   }
   await page.waitForTimeout(700);
-  return true;
+  return applied;
+}
+
+export type GoalVerdict = "confirmed" | "absent" | "unverifiable";
+
+/**
+ * Pure goal-text matcher (P0-3 fix #8): Unicode-aware, so Arabic/Hindi/short-label
+ * goals are actually checked instead of auto-passing. No extractable words at all →
+ * "unverifiable", never a silent pass. Selftested.
+ */
+export function matchGoal(pageText: string, goal: string): GoalVerdict {
+  const words = goal.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? [];
+  if (!words.length) return "unverifiable";
+  const text = pageText.toLowerCase();
+  return words.some((w) => text.includes(w)) ? "confirmed" : "absent";
 }
 
 /** Deterministic Verifier (P5.2): do distinctive goal words appear on the page now? */
-async function verifyGoal(page: Page, goal: string): Promise<boolean> {
-  const words = goal.toLowerCase().match(/[a-z]{4,}/g) ?? [];
-  if (!words.length) return true;
-  const text = (await page.evaluate(() => document.body?.innerText || "").catch(() => "")).toLowerCase();
-  return words.some((w) => text.includes(w));
+async function verifyGoal(page: Page, goal: string): Promise<GoalVerdict> {
+  const text = await page.evaluate(() => document.body?.innerText || "").catch(() => "");
+  return matchGoal(text, goal);
 }
 
 async function callNavigator(journey: Journey, stepText: string, role: string, url: string, digest: string[], transcript: string[]): Promise<{ action: NavAction | null; tokens: number }> {
@@ -198,7 +220,10 @@ async function runJourney(ctx: RunContext, sessions: Session[], project: Project
 
       const digest = await pageDigest(p);
       ctx.status(AGENT, `Journey "${journey.name}" step ${stepIdx + 1} as ${currentRole}: ${step.text}`, { url: p.url() });
-      ctx.recordTested(p.url(), AGENT); // V4 coverage matrix — journeys visit pages directly, not via sampleFor
+      // A-2 (WEBTESTER-AUDIT): journeys navigate directly rather than via sampleFor, so
+      // they record their own coverage — but only once the page actually yielded a
+      // semantic digest. A blank or failed page used to be stamped as "tested" too.
+      if (digest.length) ctx.recordTested(p.url(), AGENT);
       lastShot = await ctx.screenshot(p, `journey-${journey.name}-${action}`, { role: currentRole });
 
       const stepText = expandTokens(step.text + (step.expect ? ` (success looks like: ${step.expect})` : ""), tag);
@@ -209,15 +234,29 @@ async function runJourney(ctx: RunContext, sessions: Session[], project: Project
       transcript.push(`[${currentRole}] ${a.action}${a.target ? ` "${a.target}"` : ""}${a.value ? ` = ${a.value}` : ""}${a.why ? ` — ${a.why}` : ""}`);
 
       if (a.action === "journey_done") {
+        // P0-3: the Navigator's CLAIM is not completion. Passed = claim + the
+        // deterministic oracle confirming the goal text on the final page.
         const verified = await verifyGoal(p, journey.goal);
-        ctx.coverage.journeysPassed++;
-        ctx.finding({
-          agent: AGENT, severity: "info", kind: "improvement", role: currentRole, pageUrl: p.url(),
-          title: `Business flow "${journey.name}" passed`,
-          detail: `Completed in ${action + 1} action(s) across ${journey.steps.length} step(s).${verified ? " Goal text confirmed on the final page." : " Note: could not independently confirm the goal text — review the screenshots."}\n\nActions:\n${transcript.join("\n")}`,
-          evidence: lastShot,
-        });
-        ctx.log(AGENT, "pass", `Journey "${journey.name}" passed (${tokens} tokens)`);
+        if (verified === "confirmed") {
+          ctx.coverage.journeysPassed++;
+          ctx.finding({
+            agent: AGENT, severity: "info", kind: "improvement", role: currentRole, pageUrl: p.url(),
+            title: `Business flow "${journey.name}" passed`,
+            detail: `Completed in ${action + 1} action(s) across ${journey.steps.length} step(s). Goal text confirmed on the final page.\n\nActions:\n${transcript.join("\n")}`,
+            evidence: lastShot,
+          });
+          ctx.log(AGENT, "pass", `Journey "${journey.name}" passed (${tokens} tokens)`);
+        } else if (verified === "unverifiable") {
+          ctx.finding({
+            agent: AGENT, severity: "info", kind: "improvement", role: currentRole, pageUrl: p.url(),
+            title: `Business flow "${journey.name}" completed — unverified`,
+            detail: `The Navigator finished, but the goal text ("${journey.goal}") has no matchable words, so completion could not be independently confirmed. NOT counted as passed — review the screenshots.\n\nActions:\n${transcript.join("\n")}`,
+            evidence: lastShot,
+          });
+          ctx.log(AGENT, "warn", `Journey "${journey.name}" completed but unverifiable — not counted as passed`);
+        } else {
+          fail(stepIdx, `The Navigator claimed the flow was done, but the goal ("${journey.goal}") was not found on the final page — treating this as a failed journey, not a pass.`);
+        }
         return tokens;
       }
       if (a.action === "stuck") { fail(stepIdx, `Navigator reported it was stuck: ${a.why ?? ""}`); return tokens; }
@@ -226,25 +265,39 @@ async function runJourney(ctx: RunContext, sessions: Session[], project: Project
         // verify it's on the page now. A cross-role step with `expect` is the black-box
         // cross-user-sync check (role B must now see what role A created).
         const expect = step.expect ? expandTokens(step.expect, tag) : "";
-        if (expect && !(await verifyGoal(p, expect))) {
-          ctx.finding({ agent: AGENT, severity: "high", role: currentRole, pageUrl: p.url(),
-            title: `Business flow "${journey.name}" — step ${stepIdx + 1} expectation not met`,
-            detail: `After "${step.text}", expected to see "${step.expect}" on the page (as ${currentRole}) but it was not found. ${step.role !== journey.steps[Math.max(0, stepIdx - 1)]?.role ? "This is a cross-user check — the change another role made did not propagate to this role's view." : ""}\n\nActions so far:\n${transcript.join("\n")}`,
-            evidence: lastShot });
+        if (expect) {
+          const v = await verifyGoal(p, expect);
+          if (v === "absent") {
+            // P0-3 fix #5: a failed expectation ENDS the journey — advancing past it
+            // produced runs containing both "expectation not met" and "journey passed".
+            ctx.finding({ agent: AGENT, severity: "high", role: currentRole, pageUrl: p.url(),
+              title: `Business flow "${journey.name}" — step ${stepIdx + 1} expectation not met`,
+              detail: `After "${step.text}", expected to see "${step.expect}" on the page (as ${currentRole}) but it was not found. ${step.role !== journey.steps[Math.max(0, stepIdx - 1)]?.role ? "This is a cross-user check — the change another role made did not propagate to this role's view." : ""}\n\nActions so far:\n${transcript.join("\n")}`,
+              evidence: lastShot });
+            ctx.log(AGENT, "fail", `Journey "${journey.name}" stopped at step ${stepIdx + 1} — expectation not met`);
+            return tokens;
+          }
+          if (v === "unverifiable") ctx.log(AGENT, "warn", `Journey "${journey.name}" step ${stepIdx + 1}: expectation "${step.expect}" has no matchable words — skipped verification`);
         }
         stepIdx++;
         continue;
       }
 
-      const ok = await execute(p, a, tag, journey.persona);
-      if (!ok) transcript.push(`  ↳ could not resolve "${a.target ?? ""}"`);
+      const ok = await execute(p, a, tag, journey.persona, new URL(project.baseUrl).origin);
+      if (!ok) transcript.push(`  ↳ action failed or target "${a.target ?? ""}" could not be resolved`);
     }
-    // Loop ended without journey_done.
+    // Loop ended without journey_done. P0-3 fix #6: reaching the last step is not a
+    // pass by itself — only the final goal oracle can confirm one.
     if (stepIdx >= journey.steps.length) {
-      ctx.coverage.journeysPassed++;
-      ctx.finding({ agent: AGENT, severity: "info", kind: "improvement", role: currentRole, pageUrl: page?.url() ?? project.baseUrl,
-        title: `Business flow "${journey.name}" completed all steps`,
-        detail: `All ${journey.steps.length} step(s) reached.\n\nActions:\n${transcript.join("\n")}`, evidence: lastShot });
+      const verified = page ? await verifyGoal(page, journey.goal) : "unverifiable";
+      if (verified === "confirmed") {
+        ctx.coverage.journeysPassed++;
+        ctx.finding({ agent: AGENT, severity: "info", kind: "improvement", role: currentRole, pageUrl: page?.url() ?? project.baseUrl,
+          title: `Business flow "${journey.name}" completed all steps`,
+          detail: `All ${journey.steps.length} step(s) reached and the goal text was confirmed on the final page.\n\nActions:\n${transcript.join("\n")}`, evidence: lastShot });
+      } else {
+        fail(stepIdx - 1, `All steps were reached, but the goal ("${journey.goal}") ${verified === "absent" ? "was not found on the final page" : "could not be verified"} — not counted as passed.`);
+      }
     } else {
       fail(stepIdx, `Hit the ${maxActions}-action budget before finishing the flow.`);
     }

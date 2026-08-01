@@ -1,13 +1,14 @@
 import { chromium, firefox, webkit, type Browser, type BrowserContext } from "playwright";
 import { nanoid } from "nanoid";
 import type { Project, RoleCred, RunMode, RunReport, RunReportSession, CoverageTotals, CoverageMatrix, CoverageMatrixRow } from "../types";
-import { createRun, updateRun, getRun, listFindings, recentFindingUrls, lastFinishedCommitSha, listGraphNodes } from "../db";
+import { createRun, updateRun, getRun, listFindings, listEvents, copyFindings, recentFindingUrls, lastFinishedCommitSha, listGraphNodes, hasActiveRun } from "../db";
 import { codeRootCause, currentCommitSha, changedFilesSince, mapChangedFilesToPaths } from "./repo";
 import { RunContext } from "./context";
+import { unregisterControlWatcher } from "./control";
 import { planMission } from "./planner";
 import { profilesForMode, type BrowserEngine } from "./devices";
 import { snapshotPageLabels, reorderByChangeStatus } from "./graph";
-import { loginAgent, looksLoggedOut, detectAuthType } from "./agents/login";
+import { loginAgent, looksLoggedOut, detectAuthType, authFailureProbes } from "./agents/login";
 import { crawlAgent, urlTemplate } from "./agents/crawler";
 import { classifierAgent } from "./agents/classifier";
 import { interactionAgent } from "./agents/interaction";
@@ -24,7 +25,7 @@ import { uiAuditAgent } from "./agents/uiAudit";
 import { visualAgent } from "./agents/visual";
 import { permissionsAgent, writeIdorReplay, relAuthzReplay, type RoleSession } from "./agents/permissions";
 import { learningAgent, sessionPersistsContract } from "./agents/learning";
-import { aiReviewerAgent } from "./agents/aiReviewer";
+import { aiReviewerAgent, crossModelVerify } from "./agents/aiReviewer";
 import { regressionAgent } from "./agents/regression";
 import { registerAgent } from "./agents/register";
 import { crudAgent } from "./agents/crud";
@@ -42,8 +43,13 @@ import { seniorReviewerAgent } from "./agents/seniorReviewer";
 import { resilienceAgent } from "./agents/resilience";
 import { chaosAgent } from "./agents/chaos";
 import { withRecovery } from "./recovery";
+import { RunCancelledError } from "./control";
 import { aiHealthCheck, aiProviderLabel } from "./ai";
 import { generateReportDocs } from "./report-doc";
+import { loadExperience, recallFacts, saveExperience } from "./experience";
+import { npmAuditFindings, buildOwaspCoverage } from "./owasp";
+import { loadFeedbackMap, partitionByFeedback } from "./feedback";
+import { decideRunStatus } from "./verdict";
 
 const LAUNCHERS = { chromium, firefox, webkit } as const;
 
@@ -170,11 +176,26 @@ async function openSession(
  * without re-logging in. Additional profiles (mobile/other engines, mode-
  * dependent) get their own short-lived login + re-render pass afterward.
  */
-async function executeRun(runId: string, project: Project, mode: RunMode): Promise<void> {
+async function executeRun(runId: string, project: Project, mode: RunMode, resumeFrom?: string): Promise<void> {
   const ctx = new RunContext(runId, project.id);
-  const mission = planMission(project, mode);
+  // Cross-run experience (Plan-v8 §1): recall before the mission is planned, so the
+  // §3.5 safe-probing gate already knows what prior runs learned about this origin
+  // (and any promoted §2 global pattern) from the first agent onward.
+  const origin = new URL(project.baseUrl).origin;
+  const experience = loadExperience(origin);
+  const recalled = recallFacts(ctx.facts, experience);
+  const mission = planMission(project, mode, experience);
   const specs = sessionSpecs(project);
   ctx.log("orchestrator", "step", `Run ${runId} started for ${project.name} (${project.baseUrl}) — ${mission.reason}`);
+  if (recalled) ctx.log("orchestrator", "step", `Recalled ${recalled} fact(s) from ${experience.length} experience row(s) learned in previous runs`);
+
+  if (resumeFrom) {
+    const done = completedSteps(resumeFrom);
+    ctx.resumeSteps = done;
+    const carried = [...new Set(done)].filter((a) => a !== "login" && a !== "crawler");
+    copyFindings(resumeFrom, runId, carried);
+    ctx.log("orchestrator", "step", `Resuming the interrupted run: skipping ${done.length} step(s) it already completed and carrying their findings over. Sign-in and the crawl always re-run — they exist only in the browser.`);
+  }
 
   // AI layer health gate — surfaced FIRST, loudly. A configured-but-dead key
   // (expired/revoked → 401) used to fail late inside each AI agent; now the
@@ -269,13 +290,17 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
       ctx.log("orchestrator", "warn", `${project.roles.length} roles configured, only running the first ${MAX_SIMULTANEOUS_ROLE_SESSIONS} simultaneously (memory cap) — increase MAX_SIMULTANEOUS_ROLE_SESSIONS or split into multiple projects.`);
     }
     for (let i = 0; i < specs.length; i++) {
+      ctx.checkCancelled();
       const spec = specs[i];
       // Stagger multi-role logins: firing several credential POSTs back-to-back
       // while prior sessions poll /api/auth/session triggers burst contention /
       // auth rate-limiting, which made the last role(s) intermittently fail. A
       // short gap between logins (not before the first) makes it reliable.
       if (i > 0) await new Promise((r) => setTimeout(r, 2500));
-      const opened = await openSession(ctx, primaryBrowser, primary.contextOptions, project, spec);
+      // A-5 (WEBTESTER-AUDIT): wrapped like the extra-profile logins below. Unwrapped,
+      // a thrown primary login aborted the entire run instead of being recorded in
+      // agentsFailed and letting the verdict come out inconclusive.
+      const opened = await withRecovery(ctx, "login", () => openSession(ctx, primaryBrowser, primary.contextOptions, project, spec));
       if (!opened) {
         ctx.log("orchestrator", "warn", `Skipping ${spec.role.name}: could not establish session`);
         continue;
@@ -403,11 +428,25 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
     // browser, once per run): API response sanity (R4) and analytics coverage (R7).
     await withRecovery(ctx, "api-validation", async () => apiValidationAgent(ctx));
     await withRecovery(ctx, "analytics", async () => analyticsAgent(ctx));
+    // Plan-v8 §6.5: A06 dependency audit (repo-connected only) and A07 auth-failure
+    // probes (explicit SEC_PROBE=1 opt-in — see login.ts for why that's a second gate
+    // on top of §3.5's safe-probing gate).
+    await withRecovery(ctx, "security", () => npmAuditFindings(ctx, project));
+    const realRole = sessions.find((s) => s.role.id !== ANON_ROLE.id)?.role;
+    await withRecovery(ctx, "login", () => authFailureProbes(ctx, primaryBrowser, primary.contextOptions, project, realRole));
 
     // Lighthouse pass (V5): once per run, role-agnostic, smart/full only — see lighthouseAudit's own mode gate.
     await withRecovery(ctx, "perf", () => lighthouseAudit(ctx, mode));
     // ZAP baseline (V6): off unless ZAP=1 is set — see zapBaselineScan's own detection gate.
     await withRecovery(ctx, "security", () => zapBaselineScan(ctx, project));
+
+    // Persist learning HERE, not at the end (Plan-v8 §1/§2). Every fact and
+    // recovery this run can produce already exists by now — the stages below add
+    // findings and prose, never facts. Saving at the very end meant any early
+    // exit (cancel, crash, a killed process) discarded everything learned; that
+    // is exactly the run where accumulated knowledge is most valuable.
+    // Best-effort: a save failure must never fail the run.
+    try { saveExperience(ctx, origin); } catch (e) { ctx.log("orchestrator", "warn", `Experience save failed: ${String(e).slice(0, 160)}`); }
 
     // Root-cause correlation (P7): deterministic set math over the run's failures
     // — clusters "5 pages, one broken endpoint" into a single high finding and
@@ -434,14 +473,15 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
       const explorerBudget = mode === "full" ? Math.floor(pool * 0.25) : 0;
       if (mode === "full") aiTokens += (await withRecovery(ctx, "explorer", () => explorerAgent(ctx, sessions[0].browserCtx, sessions[0].role, mode, explorerBudget))) ?? 0;
       pool -= explorerBudget;
-      const judgeSpent = (await withRecovery(ctx, "page-judge", () => pageJudgeAgent(ctx, sessions[0].browserCtx, project, Math.floor(pool * 0.6)))) ?? 0;
+      const judgeSpent = (await withRecovery(ctx, "page-judge", () => pageJudgeAgent(ctx, sessions[0].browserCtx, project, Math.floor(pool * 0.6), mode))) ?? 0;
       aiTokens += judgeSpent;
-      aiTokens += (await withRecovery(ctx, "ai-reviewer", () => aiReviewerAgent(ctx, project, pool - judgeSpent))) ?? 0;
+      aiTokens += (await withRecovery(ctx, "ai-reviewer", () => aiReviewerAgent(ctx, project, pool - judgeSpent, mission.experienceNote))) ?? 0;
     }
 
     // Regression runs last so it diffs the complete set of this run's findings.
     await withRecovery(ctx, "regression", async () => regressionAgent(ctx, project));
   } finally {
+    unregisterControlWatcher(runId);
     for (const s of sessions) {
       await ctx.stopTrace(s.browserCtx, s.role.name);
       await s.browserCtx.close();
@@ -452,8 +492,6 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
   const findings = listFindings(runId);
   const crit = findings.filter((f) => f.severity === "critical").length;
   const high = findings.filter((f) => f.severity === "high").length;
-  // ponytail: gate on critical/high only — low/medium are advisory, not run failures.
-  const status = crit > 0 || high > 0 ? "failed" : "passed";
   const report = buildRunReport({
     attempted: specs.map((s) => ({ role: s.role.name })),
     established: sessions.map((s) => s.role.name),
@@ -462,13 +500,42 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
     missionAgents: mission.agents,
     agentsRan: [...ctx.agentsRan],
   });
+  report.missionReason = mission.reason; // PLAN-REPORT-TRUST §3
+  report.sampleSize = mission.sampleSize; // PLAN-REPORT-TRUST §3
   report.coverageTotals = computeCoverageTotals(ctx.pages, ctx.testedUrls, ctx.coverage); // P4
   report.coverageMatrix = buildCoverageMatrix(ctx.pages, ctx.tested, ctx.pageTypes); // V4
+  report.owaspCoverage = buildOwaspCoverage(ctx.tested, findings, ctx.owaspTestedExtra); // Plan-v8 §6.4
+  report.rootCauses = ctx.rootCauses; // persisted so the report can fold members under their cause (P7)
+  // Cross-model verification (Plan-v8 §4.2) — a no-op call when AI_VERIFY_MODEL is
+  // unset (checked inside crossModelVerify before any network call).
+  const feedbackParts = partitionByFeedback(findings, loadFeedbackMap(origin));
+  const confirmedByHuman = feedbackParts.confirmed;
+  const verifications = await crossModelVerify(findings, confirmedByHuman);
+  if (verifications.length) report.crossModelVerifications = verifications;
+  // Verdict policy (P0-2 + P1-12): status is decided AFTER human suppression and
+  // cross-model refutation, from bug-kind critical/high findings only — and a run
+  // whose agents failed cannot silently PASS.
+  const verdict = decideRunStatus(
+    findings,
+    new Set(feedbackParts.suppressed.map((s) => s.finding.fingerprint)),
+    new Set(verifications.filter((v) => v.verdict === "refuted").map((v) => v.fingerprint)),
+    ctx.agentsFailed.size,
+  );
+  const status = verdict.status;
+  report.statusReason = verdict.reason;
+  report.agentsFailed = [...ctx.agentsFailed].map(([name, reason]) => ({ name, reason }));
+  report.executionOutcome = ctx.agentsFailed.size ? "partial" : "completed";
   if (ctx.patterns) report.patterns = ctx.patterns; // P2
   if (ctx.arr.encountered) report.arr = { ...ctx.arr, rate: (ctx.arr.byFacts + ctx.arr.byProbe) / ctx.arr.encountered }; // §3.5/§6
   if (ctx.traces.length) report.traces = ctx.traces; // V1
   if (ctx.lighthouse.length) report.lighthouse = ctx.lighthouse; // V5
   if (regressionFocus) report.regressionFocus = regressionFocus; // V8
+  // A-6 (WEBTESTER-AUDIT): persist the near-complete report BEFORE the post-browser
+  // AI passes. A cancel or crash in that window used to unwind into the outer handler,
+  // which writes a minimal partial — throwing away a report that was already complete
+  // apart from its optional AI addenda. Written as still-running: `status` is applied
+  // at the end, so an interrupted run stays honestly non-terminal until it finishes.
+  updateRun(runId, { reportJson: JSON.stringify(report) });
   // Code-aware root cause (Plan-v6 V7): repo-connected AI pass over the worst
   // findings — probable file:line + cause + suggested fix, keyed by fingerprint.
   if (mission.useAI && project.repoPath.trim()) {
@@ -483,12 +550,16 @@ async function executeRun(runId: string, project: Project, mode: RunMode): Promi
   if (mission.useAI && sessions.length) {
     aiTokens += (await withRecovery(ctx, "senior-review", () => seniorReviewerAgent(ctx, project, report, Math.min(2000, mission.aiTokenBudget)))) ?? 0;
   }
+  // root-cause / senior-review ran AFTER the ran/skipped split above was built —
+  // refresh it so the report can't list an agent as skipped while showing its output.
+  report.agentsRan = mission.agents.filter((a) => ctx.agentsRan.has(a));
+  report.agentsSkipped = report.agentsSkipped.filter((s) => !ctx.agentsRan.has(s.name));
   const okCount = report.sessions.filter((s) => s.ok).length;
-  const headline = `${findings.length} findings (${crit} critical, ${high} high) across ${ctx.pages.length} pages, ${okCount}/${report.sessions.length} session(s) established.`;
+  const headline = `${findings.length} findings (${crit} critical, ${high} high) across ${ctx.pages.length} pages, ${okCount}/${report.sessions.length} session(s) established.${status === "inconclusive" ? ` INCONCLUSIVE: ${verdict.reason}.` : ""}`;
   const sessionLines = report.sessions.slice(0, 8).map((s) => `${s.ok ? "✓" : "✗"} ${s.role} — ${s.detail}`);
   const summary = [headline, ...sessionLines, ...digestLines(findings)].join("\n");
   updateRun(runId, { status, finishedAt: new Date().toISOString(), summary, aiTokens, reportJson: JSON.stringify(report) });
-  ctx.log("orchestrator", status === "passed" ? "pass" : "fail", headline);
+  ctx.log("orchestrator", status === "passed" ? "pass" : status === "failed" ? "fail" : "warn", headline);
   // Plain-language deliverables: data/reports/<runId>.md + .pdf — role-by-role,
   // agent-by-agent, written so a non-engineer can read what happened and why.
   try {
@@ -578,7 +649,9 @@ export function computeCoverageTotals(
   coverage: { controlsSeen: number; controlsClicked: number; journeysDefined: number; journeysPassed: number }
 ): CoverageTotals {
   const tpl = (u: string): string => { try { return urlTemplate(u); } catch { return u; } };
-  const discovered = new Set(pages.map((p) => p.url));
+  // A tested URL the crawler never listed (login page, redirect target) was still
+  // discovered — union both sides so "X of Y tested" can never exceed 100%.
+  const discovered = new Set([...pages.map((p) => p.url), ...testedUrls]);
   return {
     pagesDiscovered: discovered.size,
     pagesTested: testedUrls.size,
@@ -667,15 +740,60 @@ function digestLines(findings: { severity: keyof typeof SEVERITY_RANK; title: st
   return [`Top issues (${groups.size} distinct):`, ...lines];
 }
 
+/** The agents a run finished, in order — the resume plan for a retry of it. */
+function completedSteps(runId: string): string[] {
+  return listEvents(runId)
+    .filter((e) => e.level === "agent-done" && !(JSON.parse(e.data ?? "{}") as { failed?: boolean }).failed)
+    .map((e) => e.agent);
+}
+
 /** Creates the run row synchronously and executes in the background — returns immediately. */
-export function startRun(project: Project, mode: RunMode = "quick"): string {
+export function startRun(project: Project, mode: RunMode = "quick", resumeFrom?: string): string {
+  // P1-2 (WEBTESTER-AUDIT): one run per project at a time — concurrent runs would
+  // race graph upserts, visual baselines, experience rows, and the target itself.
+  if (hasActiveRun(project.id)) throw new Error(`Project "${project.name}" already has an active run — stop it or wait for it to finish.`);
   const runId = nanoid();
   // planMission is a pure heuristic — cheap to compute again inside executeRun rather
   // than threading it through, but the live timeline needs the agent list up front.
   const missionAgents = planMission(project, mode).agents;
   createRun({ id: runId, projectId: project.id, mode, status: "running", startedAt: new Date().toISOString(), finishedAt: null, summary: null, missionAgents });
-  void executeRun(runId, project, mode).catch((e) => {
-    updateRun(runId, { status: "error", finishedAt: new Date().toISOString(), summary: `Run crashed: ${String(e).slice(0, 300)}` });
+  void executeRun(runId, project, mode, resumeFrom).catch((e) => {
+    const stopped = e instanceof RunCancelledError;
+    const findings = listFindings(runId);
+    // P1-18 (WEBTESTER-AUDIT): every terminal run persists a schema-valid report.
+    // Sessions/coverage details died with the run context, but the agent timeline
+    // survives in events and the findings survive in their table — the report
+    // says explicitly WHY it is partial instead of silently having no report.
+    const statusReason = stopped ? "cancelled by the user before completion" : `run crashed: ${String(e).slice(0, 200)}`;
+    // A-6: if executeRun already checkpointed a report (it does so once the browser
+    // work is done, before the optional AI addenda), KEEP it and just mark it partial.
+    // Overwriting it with the skeleton below discarded a nearly complete report.
+    const existing = getRun(runId)?.reportJson;
+    let reportJson: string;
+    try {
+      if (!existing) throw new Error("no checkpoint");
+      const prior = JSON.parse(existing) as RunReport;
+      reportJson = JSON.stringify({ ...prior, executionOutcome: "partial", statusReason });
+    } catch {
+      const ranAgents = new Set(listEvents(runId).filter((ev) => ev.level === "agent-done").map((ev) => ev.agent));
+      const partialReport: RunReport = {
+        sessions: [],
+        coverage: [],
+        agentsRan: [...ranAgents],
+        agentsSkipped: [],
+        executionOutcome: "partial",
+        statusReason,
+      };
+      reportJson = JSON.stringify(partialReport);
+    }
+    updateRun(runId, {
+      status: stopped ? "cancelled" : "error",
+      finishedAt: new Date().toISOString(),
+      summary: stopped
+        ? `Stopped by the user. ${findings.length} finding(s) recorded before stopping — they are kept below.`
+        : `Run crashed: ${String(e).slice(0, 300)}`,
+      reportJson,
+    });
   });
   return runId;
 }

@@ -1,4 +1,5 @@
 import type { RunContext } from "./context";
+import { RunCancelledError, waitForHuman } from "./control";
 
 // Resilience wrapper (Plan-v2 §3.5). Senior testers don't quit on the first
 // error; neither does the runner. Runs an agent, retries once on throw, then
@@ -6,10 +7,25 @@ import type { RunContext } from "./context";
 // ponytail: retry-once + continue covers transient nav/timeout flakes. Add
 // reload / re-auth / selector-fallback rungs here if real flakiness demands it.
 export async function withRecovery<T>(
-  ctx: Pick<RunContext, "log" | "agentsRan" | "findingCounts">,
+  ctx: Pick<RunContext, "log" | "agentsRan" | "agentsFailed" | "findingCounts" | "checkCancelled" | "runId" | "skipCompleted">,
   agent: string,
   fn: () => Promise<T>
 ): Promise<T | null> {
+  ctx.checkCancelled(); // one gate before every agent — a stopped run doesn't start the next one
+  // Resume: this step already finished in the run this one picks up from. Must be
+  // asked on EVERY step (skipped or not) — it counts positions to stay in lockstep.
+  if (ctx.skipCompleted(agent)) {
+    ctx.agentsRan.add(agent);
+    ctx.log(agent, "agent-done", `${agent} skipped — already completed in the interrupted run`, { durationMs: 0, findings: 0, failed: false, resumed: true });
+    return null;
+  }
+  // Same gate for the human at the wheel: they took control of the live view, so
+  // no agent starts navigating the page out from under them until they let go.
+  await waitForHuman(
+    ctx.runId,
+    () => ctx.log(agent, "warn", `Waiting — a human is driving the live view`),
+    () => ctx.checkCancelled(),
+  );
   ctx.agentsRan.add(agent);
   const startedAt = Date.now();
   const findingsBefore = ctx.findingCounts.get(agent) ?? 0;
@@ -25,9 +41,14 @@ export async function withRecovery<T>(
       done(false);
       return result;
     } catch (e) {
+      // Stop is not a flake — never retry it, and let it unwind the whole run.
+      if (e instanceof RunCancelledError) { done(true); throw e; }
       const last = attempt === 2;
       ctx.log(agent, "warn", `${last ? "failed after retry" : "errored, retrying"}: ${String(e).slice(0, 160)}`);
       if (last) {
+        // P0-2: a twice-failed agent is recorded, not forgotten — the verdict
+        // engine downgrades the run to inconclusive instead of a silent PASS.
+        ctx.agentsFailed.set(agent, String(e).slice(0, 200));
         done(true);
         return null;
       }

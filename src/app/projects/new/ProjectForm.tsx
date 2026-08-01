@@ -131,9 +131,11 @@ An employer cannot edit a job after it is closed`}
           {roles.map((r) => (
             <div key={r.key} className="rounded-lg border border-line bg-background/40 p-3">
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                <input className={input} placeholder="Role name (Admin)" value={r.name} onChange={(e) => updateRole(r.key, "name", e.target.value)} name="role_name" />
-                <input className={input} placeholder="Username / email" value={r.username} onChange={(e) => updateRole(r.key, "username", e.target.value)} name="role_username" />
-                <input className={input} placeholder="Password" type="password" value={r.password} onChange={(e) => updateRole(r.key, "password", e.target.value)} name="role_password" />
+                {/* a11y: these three had placeholders only. A placeholder is not a
+                    label — it vanishes on input and screen readers may skip it. */}
+                <input className={input} aria-label="Role name" placeholder="Role name (Admin)" value={r.name} onChange={(e) => updateRole(r.key, "name", e.target.value)} name="role_name" />
+                <input className={input} aria-label="Role username or email" placeholder="Username / email" value={r.username} onChange={(e) => updateRole(r.key, "username", e.target.value)} name="role_username" />
+                <input className={input} aria-label="Role password" placeholder="Password" type="password" value={r.password} onChange={(e) => updateRole(r.key, "password", e.target.value)} name="role_password" />
               </div>
               {roles.length > 1 && (
                 <button type="button" onClick={() => setRoles((rs) => rs.filter((x) => x.key !== r.key))} className="mt-2 text-xs font-medium text-red-400 hover:text-red-300">

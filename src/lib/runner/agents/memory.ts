@@ -49,7 +49,7 @@ export async function memoryLeakAgent(ctx: RunContext, browserCtx: BrowserContex
   const readings: MemReading[] = [];
   try {
     for (let i = 0; i < NAVIGATIONS; i++) {
-      await page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+      await ctx.observe(page, target.url, AGENT).catch(() => {});
       await page.waitForTimeout(600);
       const r = await page.evaluate(() => ({
         heap: (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? 0,

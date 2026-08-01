@@ -1,0 +1,28 @@
+# Quality gate (WEBTESTER-AUDIT P2-15) — the same battery run locally after every change.
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Type check
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint
+      - name: Clean-database startup
+        run: npm run db:cleantest
+      - name: Self-test suite
+        run: npm run agents:test
+      - name: Production build
+        run: npm run build
+      - name: Dependency audit (production deps, high+)
+        run: npm audit --omit=dev --audit-level=high

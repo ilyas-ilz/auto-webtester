@@ -6,6 +6,7 @@ import path from "path";
 import os from "os";
 import { RunContext } from "../context";
 import type { Project, Severity } from "../../types";
+import { owaspForCwe } from "../owasp";
 
 const AGENT = "security";
 const execFileAsync = promisify(execFile);
@@ -28,7 +29,7 @@ export async function securityAgent(
   if (emitHeaders) {
     if (!isHttps && project.envTag === "production") {
       ctx.finding({ agent: AGENT, severity: "high", role: null, pageUrl: url,
-        title: "Production site not served over HTTPS", detail: "Traffic is unencrypted.", evidence: null });
+        title: "Production site not served over HTTPS", detail: "Traffic is unencrypted.", evidence: null, owasp: ["A02:2021"] });
     }
     try {
       const resp = await browserCtx.request.get(url, { timeout: 15000 });
@@ -40,10 +41,10 @@ export async function securityAgent(
         { key: "referrer-policy", sev: "low", msg: "Missing Referrer-Policy." },
       ];
       for (const c of missing) {
-        if (!h[c.key]) ctx.finding({ agent: AGENT, severity: c.sev, role: null, pageUrl: url, title: c.msg, detail: `Header "${c.key}" absent on ${url}.`, evidence: null });
+        if (!h[c.key]) ctx.finding({ agent: AGENT, severity: c.sev, role: null, pageUrl: url, title: c.msg, detail: `Header "${c.key}" absent on ${url}.`, evidence: null, owasp: ["A05:2021"] });
       }
       if (isHttps && !h["strict-transport-security"]) {
-        ctx.finding({ agent: AGENT, severity: "medium", role: null, pageUrl: url, title: "Missing Strict-Transport-Security (HSTS).", detail: "HTTPS sites should send HSTS.", evidence: null });
+        ctx.finding({ agent: AGENT, severity: "medium", role: null, pageUrl: url, title: "Missing Strict-Transport-Security (HSTS).", detail: "HTTPS sites should send HSTS.", evidence: null, owasp: ["A05:2021"] });
       }
     } catch (e) {
       ctx.log(AGENT, "warn", `Header fetch failed: ${String(e).slice(0, 160)}`);
@@ -58,8 +59,9 @@ export async function securityAgent(
     if (!session.secure && project.envTag !== "localhost") bad.push("not Secure (can be sent over HTTP)");
     if (session.sameSite === "None") bad.push("SameSite=None (CSRF exposure)");
     if (bad.length) {
+      // A02 (cryptographic failures — token exposure) and A05 (misconfiguration) both apply.
       ctx.finding({ agent: AGENT, severity: "high", role: null, pageUrl: url,
-        title: `Session cookie "${session.name}" is weakly configured`, detail: bad.join("; "), evidence: null });
+        title: `Session cookie "${session.name}" is weakly configured`, detail: bad.join("; "), evidence: null, owasp: ["A02:2021", "A05:2021"] });
     }
   }
   ctx.recordTested(url, AGENT); // V4 coverage matrix — security only checks the base URL, not a page sample
@@ -73,9 +75,9 @@ export async function securityAgent(
 // moat and ZAP can't do it; this only adds passive header/cookie/info-disclosure
 // coverage beyond the deterministic checks above.
 
-interface ZapAlert { name: string; riskcode: string; desc: string; solution: string; instances?: { uri: string }[] }
+interface ZapAlert { name: string; riskcode: string; desc: string; solution: string; instances?: { uri: string }[]; cweid?: number | string; wascid?: number | string; alertRef?: string; confidence?: string }
 interface ZapReport { site?: { alerts?: ZapAlert[] }[] }
-export interface ParsedZapFinding { severity: Severity; title: string; detail: string; pageUrl: string | null }
+export interface ParsedZapFinding { severity: Severity; title: string; detail: string; pageUrl: string | null; owasp?: string[]; cweid: number | null; wascid: number | null; alertRef: string | null; zapConfidence: string | null }
 
 const ZAP_RISK_TO_SEVERITY: Record<string, Severity> = { "3": "high", "2": "medium", "1": "low", "0": "info" };
 // Alert names ZAP's baseline reliably flags that our own header checks above
@@ -91,11 +93,14 @@ export function parseZapAlerts(report: ZapReport): ParsedZapFinding[] {
   const findings: ParsedZapFinding[] = [];
   for (const a of alerts) {
     if (ZAP_DEDUPE_SUBSTR.some((s) => a.name.toLowerCase().includes(s))) continue;
+    const cweid = a.cweid != null ? Number(a.cweid) : null;
     findings.push({
       severity: ZAP_RISK_TO_SEVERITY[a.riskcode] ?? "info",
       title: `ZAP: ${a.name}`,
       detail: `${a.desc}${a.solution ? `\n\nSolution: ${a.solution}` : ""}${(a.instances?.length ?? 0) > 1 ? `\n\n${a.instances!.length} instance(s) found.` : ""}`,
       pageUrl: a.instances?.[0]?.uri ?? null,
+      owasp: owaspForCwe(cweid),
+      cweid, wascid: a.wascid != null ? Number(a.wascid) : null, alertRef: a.alertRef ?? null, zapConfidence: a.confidence ?? null,
     });
   }
   return findings;
@@ -158,7 +163,14 @@ export async function zapBaselineScan(ctx: RunContext, project: Project): Promis
 
   const parsed = parseZapAlerts(report);
   for (const f of parsed) {
-    ctx.finding({ agent: AGENT, severity: f.severity, source: "zap", role: null, pageUrl: f.pageUrl, title: f.title, detail: f.detail, evidence: null });
+    // cweid/wascid/alertRef/confidence kept (not discarded) — ZAP's own alert
+    // metadata, useful for anyone triaging against ZAP directly; owasp is the
+    // derived Top-10 category (§6.3) used by the coverage matrix.
+    ctx.finding({
+      agent: AGENT, severity: f.severity, source: "zap", role: null, pageUrl: f.pageUrl, title: f.title, detail: f.detail,
+      evidence: JSON.stringify({ cweid: f.cweid, wascid: f.wascid, alertRef: f.alertRef, zapConfidence: f.zapConfidence }),
+      owasp: f.owasp,
+    });
   }
   ctx.log(AGENT, "pass", `ZAP baseline scan complete — ${parsed.length} finding(s) (deduped against header checks).`);
 }

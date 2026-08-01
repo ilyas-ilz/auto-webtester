@@ -32,7 +32,7 @@ export async function fileUploadAgent(ctx: RunContext, browserCtx: BrowserContex
     if (tested >= MAX_INPUTS) break;
     const page = await browserCtx.newPage();
     try {
-      await page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, target.url, AGENT);
       const inputs = page.locator('input[type="file"]');
       const count = await inputs.count();
       if (!count) continue;

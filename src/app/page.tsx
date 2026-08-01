@@ -1,5 +1,9 @@
 import Link from "next/link";
 import { listProjectsSafe, listRuns, listFindings } from "@/lib/db";
+
+// P0-5 (WEBTESTER-AUDIT): this page reads SQLite — without this, `next build`
+// prerenders it once and production serves a frozen build-time project list.
+export const dynamic = "force-dynamic";
 import { Card } from "@/components/Card";
 import { StatusBadge } from "@/components/StatusBadge";
 import { timeAgo } from "@/lib/format";
@@ -43,9 +47,13 @@ export default function Home() {
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((p) => {
-            const lastRun = listRuns(p.id)[0];
+            const runs = listRuns(p.id);
+            const lastRun = runs[0];
+            // P2-19 (WEBTESTER-AUDIT): severity badge from the last TERMINAL run —
+            // a half-finished run's partial findings are not a quality verdict.
+            const lastTerminal = runs.find((r) => r.status !== "running" && r.status !== "queued");
             // ponytail: counted in the page, not cached — a handful of projects, one SQLite read each.
-            const sev = lastRun ? listFindings(lastRun.id).reduce((a, f) => ({ ...a, [f.severity]: (a[f.severity] ?? 0) + 1 }), {} as Record<string, number>) : {};
+            const sev = lastTerminal ? listFindings(lastTerminal.id).reduce((a, f) => ({ ...a, [f.severity]: (a[f.severity] ?? 0) + 1 }), {} as Record<string, number>) : {};
             return (
               <Link key={p.id} href={`/projects/${p.id}`}>
                 <Card className="flex h-full flex-col gap-3 p-5 transition-colors hover:border-indigo-500/40 hover:bg-panel-2">
@@ -58,7 +66,7 @@ export default function Home() {
                     {SEV_ORDER.map((s) => sev[s] ? (
                       <span key={s} className={`rounded-md border px-1.5 py-0.5 font-mono text-[11px] ${SEV_STYLES[s]}`}>{sev[s]} {s}</span>
                     ) : null)}
-                    {lastRun && !SEV_ORDER.some((s) => sev[s]) ? <span className="font-mono text-[11px] text-muted">no findings</span> : null}
+                    {lastTerminal && !SEV_ORDER.some((s) => sev[s]) ? <span className="font-mono text-[11px] text-muted">no findings</span> : null}
                   </div>
                   <div className="mt-auto flex items-center justify-between border-t border-line pt-3 text-xs text-muted">
                     <span>{p.roles.length} role{p.roles.length === 1 ? "" : "s"}</span>

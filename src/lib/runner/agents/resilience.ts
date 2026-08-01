@@ -56,7 +56,7 @@ export async function resilienceAgent(ctx: RunContext, browserCtx: BrowserContex
     try {
       const target = sample[0];
       const page = await rctx.newPage();
-      await page.goto(target.url, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+      await ctx.observe(page, target.url, AGENT).catch(() => {});
       await rctx.setOffline(true);
       await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
       await page.waitForTimeout(800);

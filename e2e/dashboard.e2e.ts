@@ -1,5 +1,5 @@
 // Real-browser end-to-end test of the webtester dashboard ITSELF (the Next.js UI
-// at localhost:3000), as opposed to the target sites the tool points its agents at.
+// at localhost:3400), as opposed to the target sites the tool points its agents at.
 //
 // Drives the actual UI with a real Playwright chromium: home renders -> create a
 // project through the real form + server action -> start a Quick run (0 AI budget,
@@ -11,8 +11,9 @@
 // ponytail: reuses the already-installed `playwright` dep + `tsx`, mirroring
 // selftest.ts. No @playwright/test framework, no config, no new dependency.
 //
-// Run:  npm run ui:e2e            (dev server must be up: npm run dev)
-// Env:  E2E_BASE_URL (default http://localhost:3000)
+// Run:  npm run ui:e2e            (server must be up: npm run dev, or build + start
+//                                  for the production-mode gate the audit asks for)
+// Env:  E2E_BASE_URL (default http://localhost:3400)
 //       E2E_TARGET_URL (default https://example.com — tiny, quick run finishes fast)
 //       E2E_RUN_TIMEOUT_MS (default 180000)
 
@@ -22,12 +23,15 @@ import { chromium } from "playwright";
 const BASE = process.env.E2E_BASE_URL ?? "http://localhost:3400";
 const TARGET = process.env.E2E_TARGET_URL ?? "https://example.com";
 const RUN_TIMEOUT_MS = Number(process.env.E2E_RUN_TIMEOUT_MS ?? 180_000);
-const TERMINAL = new Set(["passed", "failed", "error"]);
+// Every non-running status, so a new terminal state can never make this test hang
+// until timeout: "inconclusive" (WEBTESTER-AUDIT P0-2 — a run whose agents failed)
+// and "cancelled" both end a run just as finally as passed/failed/error.
+const TERMINAL = new Set(["passed", "failed", "inconclusive", "error", "cancelled"]);
 
 const steps: string[] = [];
 function ok(msg: string): void {
   steps.push(msg);
-  // eslint-disable-next-line no-console -- CLI test harness, mirrors selftest.ts
+   
   console.log(`  ✓ ${msg}`);
 }
 
@@ -42,7 +46,7 @@ async function reachable(): Promise<boolean> {
 
 async function main(): Promise<void> {
   if (!(await reachable())) {
-    // eslint-disable-next-line no-console
+     
     console.error(`✗ dev server not reachable at ${BASE}\n  Start it first:  npm run dev   (or set E2E_BASE_URL)`);
     process.exit(2);
   }
@@ -114,10 +118,10 @@ async function main(): Promise<void> {
     projectId = "";
     ok("project deleted (cleanup verified — no orphan left behind)");
 
-    // eslint-disable-next-line no-console
+     
     console.log(`\n✓ UI e2e PASSED — ${steps.length} steps, run ended "${status}"`);
   } catch (err) {
-    // eslint-disable-next-line no-console
+     
     console.error(`\n✗ UI e2e FAILED at step ${steps.length + 1}:`, err instanceof Error ? err.message : err);
     if (projectId) {
       // Best-effort cleanup so a failed test doesn't leave a stray project.

@@ -11,6 +11,9 @@ const AGENT = "route-health";
 export function routeHealthAgent(ctx: RunContext, role: RoleCred): void {
   const pages = ctx.pages.filter((p) => p.role === role.name);
   for (const p of pages) {
+    // A-1 (WEBTESTER-AUDIT): this agent stamps its OWN coverage, as it examines each
+    // crawled page — the crawler no longer claims this dimension on its behalf.
+    ctx.recordTested(p.url, AGENT);
     if (p.status !== null && p.status >= 500) {
       ctx.finding({ agent: AGENT, severity: "high", role: role.name, pageUrl: p.url,
         title: `Server error ${p.status} on ${p.url}`, detail: `Route returned HTTP ${p.status}.`, evidence: p.screenshot });
@@ -18,7 +21,7 @@ export function routeHealthAgent(ctx: RunContext, role: RoleCred): void {
       ctx.finding({ agent: AGENT, severity: "medium", role: role.name, pageUrl: p.url,
         title: `Broken route ${p.status} on ${p.url}`, detail: `Route returned HTTP ${p.status}.`, evidence: p.screenshot });
     }
-    if (!p.title) {
+    if (!p.title && !p.probed) { // probed siblings were never rendered — no real title to judge
       ctx.finding({ agent: AGENT, severity: "low", role: role.name, pageUrl: p.url,
         title: "Page has no <title>", detail: "Missing document title hurts tabs, SEO, and screen-reader orientation.", evidence: p.screenshot });
     }

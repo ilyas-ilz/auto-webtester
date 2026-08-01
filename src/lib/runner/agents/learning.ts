@@ -47,7 +47,7 @@ export async function learningAgent(
   for (const p of pages) {
     const page = await browserCtx.newPage();
     try {
-      await page.goto(p.url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, p.url, AGENT);
       const subject = ctx.pageTypes.get(p.url) ?? new URL(p.url).pathname;
       ctx.status(AGENT, `Probing unknown controls on ${p.url} as ${role.name}`, { url: p.url });
 

@@ -43,7 +43,7 @@ export async function a11yAgent(ctx: RunContext, browserCtx: BrowserContext, rol
   for (const url of urls) {
     const page = await browserCtx.newPage();
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, url, AGENT);
       await scrollToBottom(page).catch(() => {}); // mount lazy content so axe audits the whole page, not just above the fold
       await page.addScriptTag({ path: AXE_PATH });
       const violations = (await page.evaluate(async (shown: number) => {

@@ -70,7 +70,7 @@ export async function explorerAgent(ctx: RunContext, browserCtx: BrowserContext,
   page.on("dialog", (d) => void d.dismiss().catch(() => {}));
 
   try {
-    await page.goto(start.url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+    await ctx.observe(page, start.url, AGENT, { timeout: 30000 }).catch(() => {});
     for (let step = 0; step < MAX_ACTIONS && tokens < tokenBudget; step++) {
       const digest = await pageDigest(page);
       ctx.status(AGENT, `Free-roam exploring as ${role.name}`, { url: page.url() });

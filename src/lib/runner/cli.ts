@@ -4,13 +4,32 @@ import { nanoid } from "nanoid";
 import type { Project, RoleCred, RunMode } from "../types";
 import { createProject, listFindings } from "../db";
 import { runProject } from "./orchestrate";
+import { recordFeedbackForFinding, type FeedbackVerdict } from "./feedback";
 
 function arg(name: string, def?: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : def;
 }
 
+const FEEDBACK_VERDICTS: FeedbackVerdict[] = ["confirmed", "false_positive", "intended"];
+
+/** Plan-v8 §3.3 — the laziest feedback entry point: mark a finding once, it's
+ * suppressed (with this reason, never deleted) in every future report for the site. */
+function feedbackCommand(): void {
+  const [runId, findingIdStr, verdict, reason] = process.argv.slice(3);
+  if (!runId || !findingIdStr || !FEEDBACK_VERDICTS.includes(verdict as FeedbackVerdict)) {
+    console.error(`Usage:\n  npm run agents -- feedback <runId> <findingId> confirmed|false_positive|intended ["reason"]`);
+    process.exit(1);
+  }
+  const result = recordFeedbackForFinding(runId, Number(findingIdStr), verdict as FeedbackVerdict, reason ?? "");
+  if (!result.ok) { console.error(result.error); process.exit(1); }
+  console.log(`Recorded: finding #${findingIdStr} ("${result.findingTitle}") marked ${verdict} for ${result.origin}.`);
+  console.log(verdict === "confirmed" ? "It will be tagged as human-confirmed in every future report." : "It will be suppressed (with this reason, never deleted) in every future report until changed.");
+  process.exit(0);
+}
+
 async function main(): Promise<void> {
+  if (process.argv[2] === "feedback") { feedbackCommand(); return; }
   const demo = process.argv.includes("--demo");
   let project: Project;
 

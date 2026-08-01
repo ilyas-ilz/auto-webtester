@@ -43,7 +43,7 @@ export async function dataIntegrityAgent(ctx: RunContext, browserCtx: BrowserCon
   for (const url of urls) {
     const page = await browserCtx.newPage();
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await ctx.observe(page, url, AGENT);
       const text = await page.evaluate(() => document.body?.innerText ?? "");
 
       const currencies = text.match(CURRENCY_RE) ?? [];

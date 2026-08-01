@@ -21,6 +21,7 @@ export interface BenchFinding {
   title: string;
   detail: string;
   pageUrl: string | null;
+  fingerprint?: string; // present when fed from db findings; enables the human-FP metric
 }
 
 // Which fleet agents can legitimately claim a defect of each dimension. Wider
@@ -35,6 +36,9 @@ const AGENTS_BY_DIMENSION: Record<string, string[]> = {
   perf: ["perf"],
   seo: ["seo"],
   "data-integrity": ["data-integrity"],
+  // Layout/responsive defects: ui-audit owns overflow, clipped text, dead links and
+  // cross-page design-token drift; visual owns broken images and layout shift.
+  ui: ["ui-audit", "visual"],
   permissions: ["permissions"],
   api: ["route-health", "api-validation", "api-mapper", "root-cause"],
 };
@@ -49,6 +53,8 @@ export interface BenchScore {
   unseededFindings: number; // findings matching no seeded defect — includes both noise AND legit unseeded observations
   unseededRate: number;
   duplicateRate: number; // findings repeating another finding's (normalized title, page)
+  humanFalsePositives: number; // findings a human reviewer marked false_positive/intended (Plan-v8 §3.3) — confirmed noise, unlike unseeded which may be legit
+  humanFpRate: number;
 }
 
 function defectMatchesFinding(d: SeededDefect, f: BenchFinding): boolean {
@@ -59,7 +65,7 @@ function defectMatchesFinding(d: SeededDefect, f: BenchFinding): boolean {
   return true;
 }
 
-export function scoreBench(defects: SeededDefect[], findings: BenchFinding[]): BenchScore {
+export function scoreBench(defects: SeededDefect[], findings: BenchFinding[], suppressedFingerprints?: ReadonlySet<string>): BenchScore {
   const detected: SeededDefect[] = [];
   const missed: SeededDefect[] = [];
   const matchedFindings = new Set<number>();
@@ -82,6 +88,12 @@ export function scoreBench(defects: SeededDefect[], findings: BenchFinding[]): B
   }
   const duplicates = [...seen.values()].filter((c) => c > 1).reduce((acc, c) => acc + c - 1, 0);
 
+  // Plan-v8 §3.3 human-FP feed — additive so every pre-v8 metric stays comparable
+  // to the 73% baseline; a suppressed finding still participates in matching above.
+  const humanFalsePositives = suppressedFingerprints?.size
+    ? findings.filter((f) => f.fingerprint && suppressedFingerprints.has(f.fingerprint)).length
+    : 0;
+
   return {
     total: defects.length,
     detected,
@@ -92,6 +104,8 @@ export function scoreBench(defects: SeededDefect[], findings: BenchFinding[]): B
     unseededFindings: findings.length - matchedFindings.size,
     unseededRate: findings.length ? (findings.length - matchedFindings.size) / findings.length : 0,
     duplicateRate: findings.length ? duplicates / findings.length : 0,
+    humanFalsePositives,
+    humanFpRate: findings.length ? humanFalsePositives / findings.length : 0,
   };
 }
 
@@ -107,6 +121,7 @@ export function formatBenchReport(app: string, s: BenchScore): string {
     `  findings total  ${s.totalFindings} (${s.unseededFindings} unseeded → ${pct(s.unseededRate)} unseeded rate)`,
     `  duplicate rate  ${pct(s.duplicateRate)}`,
   ];
+  if (s.humanFalsePositives) lines.push(`  human FPs       ${s.humanFalsePositives} (${pct(s.humanFpRate)}) — reviewer-confirmed noise`);
   if (s.missed.length) {
     lines.push(`  MISSED:`);
     for (const d of s.missed) lines.push(`    ✗ [${d.id}] (${d.dimension}) ${d.note ?? d.keyword ?? d.path}`);

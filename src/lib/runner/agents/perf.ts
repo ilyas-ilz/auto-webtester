@@ -24,7 +24,7 @@ export async function perfAgent(ctx: RunContext, browserCtx: BrowserContext, rol
   for (const url of urls) {
     const page = await browserCtx.newPage();
     try {
-      await page.goto(url, { waitUntil: "load", timeout: 30000 });
+      await ctx.observe(page, url, AGENT, { waitUntil: "load", timeout: 30000 });
       const timing = await page.evaluate(() => {
         const n = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
         return n ? { load: Math.round(n.loadEventEnd - n.startTime), dcl: Math.round(n.domContentLoadedEventEnd - n.startTime) } : null;
